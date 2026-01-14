@@ -10,6 +10,7 @@ PS4 and PS5 (executed without prepending SITE). In particular:
  - KILL - kill the FTP server.
  - MTRW - remount /system and /system_ex with write permissions.
  - SELF - toggle on-the-fly SELF to ELF decryption (enabled by default).
+ - SCHK - toggle SELF digest verification (enabled by default).
 
 Note: the SELF command operates on induvidual connections so use e.g.,
 ```console

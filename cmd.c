@@ -30,6 +30,7 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1870,34 +1871,74 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
  **/
 static int
 ftp_cmd_RETR_self2elf(ftp_env_t *env, int fd) {
-  FILE* tmpf;
-  int err;
+  off_t off = env->data_offset;
+  int is_rest = env->data_offset_is_rest;
+  size_t remaining;
+  int err = 0;
+  uint8_t *elf_buf = NULL;
+  size_t elf_buf_size = 0;
 
-  if(!(tmpf=tmpfile())) {
+  env->data_offset = 0;
+  env->data_offset_is_rest = 0;
+
+  if(env->type == 'A' && off != 0 && is_rest) {
+    return ftp_active_printf(env, "504 REST not supported in ASCII mode\r\n");
+  }
+
+  if(self_decode_elf(fd, &elf_buf, &elf_buf_size, env->self_verify)) {
+    if(env->passive_fd >= 0) {
+      close(env->passive_fd);
+      env->passive_fd = -1;
+    }
+    if(env->data_fd >= 0) {
+      close(env->data_fd);
+      env->data_fd = -1;
+    }
+    if(errno == EBADMSG) {
+      return ftp_active_printf(env, "550 ELF digest mismatch\r\n");
+    }
     return ftp_perror(env);
   }
 
-  if(ftp_active_printf(env, "150-Extracting ELF...\r\n")) {
-    fclose(tmpf);
+  if((off_t)elf_buf_size <= off) {
+    remaining = 0;
+  } else {
+    remaining = (size_t)((off_t)elf_buf_size - off);
+  }
+
+  if(ftp_active_printf(env, "150 Starting data transfer\r\n")) {
+    munmap(elf_buf, elf_buf_size);
     return -1;
   }
-  if(self_extract_elf_ex(fd, fileno(tmpf), env->self_verify)) {
-    if(errno != EBADMSG) {
-      err = ftp_perror(env);
-      fclose(tmpf);
-      return err;
-    }
-    if(ftp_active_printf(env, "150-Warning: ELF digest mismatch\r\n")) {
-      fclose(tmpf);
-      return -1;
-    }
+
+  if(ftp_data_open(env)) {
+    munmap(elf_buf, elf_buf_size);
+    return ftp_data_open_error_reply(env);
   }
 
-  rewind(tmpf);
-  err = ftp_cmd_RETR_fd(env, fileno(tmpf));
-  fclose(tmpf);
+  if(remaining) {
+#ifdef TCP_NOPUSH
+    int one = 1;
+    if(remaining >= 128*1024) {
+      (void)setsockopt(env->data_fd, IPPROTO_TCP, TCP_NOPUSH, &one,
+                       sizeof(one));
+    }
+#endif
+ 
+    if(io_nwrite(env->data_fd, elf_buf + (size_t)off, remaining)) {
+      munmap(elf_buf, elf_buf_size);
+      err = ftp_data_xfer_error_reply(env);
+      ftp_data_close(env);
+      return err;
+    }
+  }
+  munmap(elf_buf, elf_buf_size);
 
-  return err;
+  if(ftp_data_close(env)) {
+    return ftp_perror(env);
+  }
+
+  return ftp_active_printf(env, "226 Transfer completed\r\n");
 }
 
 
@@ -1909,6 +1950,7 @@ ftp_cmd_RETR(ftp_env_t *env, const char* arg) {
   char path[PATH_MAX];
   int err;
   int fd;
+  size_t elf_size = 0;
 
   if(!arg[0]) {
     return ftp_active_printf(env, "501 Usage: RETR <PATH>\r\n");
@@ -1921,7 +1963,11 @@ ftp_cmd_RETR(ftp_env_t *env, const char* arg) {
     return ftp_perror(env);
   }
 
-  if(env->self2elf && self_is_valid(path)) {
+  if(env->self2elf) {
+    elf_size = self_is_valid(path);
+  }
+
+  if(env->self2elf && elf_size) {
     err = ftp_cmd_RETR_self2elf(env, fd);
   } else {
     err = ftp_cmd_RETR_fd(env, fd);
