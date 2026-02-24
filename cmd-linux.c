@@ -25,6 +25,14 @@ ftp_cmd_MTRW(ftp_env_t *env, const char* arg) {
   return ftp_cmd_unavailable(env, arg);
 }
 
+/**
+ * Change process authid.
+ **/
+int
+ftp_cmd_AUTHID(ftp_env_t *env, const char* arg) {
+  return ftp_cmd_unavailable(env, arg);
+}
+
 
 /*
   Local Variables:

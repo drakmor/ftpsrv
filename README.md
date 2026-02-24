@@ -9,6 +9,7 @@ The payload supports a couple of custom SITE commands specifically for the
 PS4 and PS5 (executed without prepending SITE). In particular:
  - KILL - kill the FTP server.
  - MTRW - remount /system and /system_ex with write permissions.
+ - AUTHID <hex_authid> - set process AuthID (PS5 only).
  - SELF - toggle on-the-fly SELF to ELF decryption (enabled by default).
  - SCHK - toggle SELF digest verification.
 
@@ -28,6 +29,7 @@ These commands are implemented but were not previously documented here:
  - SITE SYMLINK <target> <link> - create a symlink.
  - SITE CPFR <from> / SITE CPTO <to> - server-side copy (asynchronous).
  - SITE COPY <from> <to> - server-side copy (asynchronous).
+ - SITE AUTHID <hex_authid> - set process AuthID (PS5 only).
 
 Note: the copy commands return immediately with "250 Copy started in background";
 errors during the background copy are not reported to the client.

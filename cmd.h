@@ -111,6 +111,7 @@ int ftp_cmd_ABOR(ftp_env_t *env, const char* arg);
  **/
 int ftp_cmd_KILL(ftp_env_t *env, const char* arg);
 int ftp_cmd_MTRW(ftp_env_t *env, const char* arg);
+int ftp_cmd_AUTHID(ftp_env_t *env, const char* arg);
 int ftp_cmd_CHMOD(ftp_env_t *env, const char* arg);
 int ftp_cmd_UMASK(ftp_env_t *env, const char* arg);
 int ftp_cmd_SYMLINK(ftp_env_t *env, const char* arg);

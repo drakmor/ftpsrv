@@ -3809,6 +3809,7 @@ ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
                            " SITE CPFR\r\n"
                            " SITE CPTO\r\n"
                            " SITE COPY\r\n"
+                           " SITE AUTHID\r\n"
                            " UTF8\r\n"
                            " REST STREAM\r\n"
                            "211 End\r\n");
@@ -3993,7 +3994,7 @@ ftp_cmd_HELP(ftp_env_t *env, const char *arg) {
                            " LIST NLST MLSD MLST RETR STOR APPE\r\n"
                            " DELE RMD RMDA MKD RNFR RNTO REST XQUOTA\r\n"
                            " PASV PORT EPSV EPRT SYST NOOP QUIT\r\n"
-                           " SITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY\r\n"
+                           " SITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY AUTHID\r\n"
                            "214 End\r\n");
 }
 
