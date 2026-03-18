@@ -50,6 +50,10 @@ typedef struct ftp_env {
   pthread_t copy_thread;
   int copy_in_progress;
   int copy_thread_valid;
+  pthread_mutex_t delete_mutex;
+  pthread_t delete_thread;
+  int delete_in_progress;
+  int delete_thread_valid;
   struct sockaddr_in data_addr;
   void *xfer_buf;
   size_t xfer_buf_size;

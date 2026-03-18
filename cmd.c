@@ -1540,8 +1540,320 @@ ftp_dir_size(const char *path, uintmax_t *size_out) {
 /**
  * Recursively delete a directory and its contents.
  **/
+#define FTP_NOTIFY_PATH_SIZE 224
+#define FTP_DELETE_NOTIFY_CHECK_ITEMS 64
+
+static void
+ftp_compact_path(const char *path, char *out, size_t out_size) {
+  size_t len;
+  size_t head;
+  size_t tail;
+
+  if(!out || out_size == 0) {
+    return;
+  }
+
+  out[0] = '\0';
+  if(!path) {
+    return;
+  }
+
+  len = strlen(path);
+  if(len + 1 <= out_size) {
+    memcpy(out, path, len + 1);
+    return;
+  }
+
+  if(out_size < 5) {
+    strncpy(out, path, out_size - 1);
+    out[out_size - 1] = '\0';
+    return;
+  }
+
+  head = (out_size - 4) / 2;
+  tail = out_size - 4 - head;
+  memcpy(out, path, head);
+  memcpy(out + head, "...", 3);
+  memcpy(out + head + 3, path + len - tail, tail);
+  out[out_size - 1] = '\0';
+}
+
+static uintmax_t
+ftp_saturating_add(uintmax_t lhs, uintmax_t rhs) {
+  if(UINTMAX_MAX - lhs < rhs) {
+    return UINTMAX_MAX;
+  }
+
+  return lhs + rhs;
+}
+
+static void
+ftp_now(struct timespec *ts) {
+  if(!ts) {
+    return;
+  }
+
+#ifdef CLOCK_MONOTONIC
+  if(clock_gettime(CLOCK_MONOTONIC, ts) == 0) {
+    return;
+  }
+#endif
+
+  ts->tv_sec = time(NULL);
+  ts->tv_nsec = 0;
+}
+
+static double
+ftp_elapsed_seconds(const struct timespec *start, const struct timespec *end) {
+  time_t sec;
+  long nsec;
+
+  if(!start || !end) {
+    return 0.0;
+  }
+
+  sec = end->tv_sec - start->tv_sec;
+  nsec = end->tv_nsec - start->tv_nsec;
+  if(nsec < 0) {
+    sec -= 1;
+    nsec += 1000000000L;
+  }
+
+  return (double)sec + ((double)nsec / 1000000000.0);
+}
+
+typedef struct {
+  uintmax_t total_entries;
+  uintmax_t deleted_entries;
+  uintmax_t last_notify_entries;
+  uintmax_t next_check_entries;
+  struct timespec last_notify_ts;
+  int has_last_notify_ts;
+} ftp_delete_progress_t;
+
+typedef struct {
+  ftp_env_t *env;
+  char path[PATH_MAX];
+  char path_notify[FTP_NOTIFY_PATH_SIZE];
+  ftp_delete_progress_t progress;
+} ftp_delete_task_t;
+
+static void ftp_copy_thread_cleanup(ftp_env_t *env);
+static void ftp_delete_thread_cleanup(ftp_env_t *env);
+static void *ftp_delete_thread(void *arg);
+
+static void
+ftp_delete_format_rate(double items_per_sec, char *out, size_t out_size) {
+  if(!out || out_size == 0) {
+    return;
+  }
+
+  if(items_per_sec < 0.0) {
+    items_per_sec = 0.0;
+  }
+
+  if(items_per_sec >= 100.0) {
+    snprintf(out, out_size, "%.0f items/s", items_per_sec);
+  } else if(items_per_sec >= 10.0) {
+    snprintf(out, out_size, "%.1f items/s", items_per_sec);
+  } else {
+    snprintf(out, out_size, "%.2f items/s", items_per_sec);
+  }
+}
+
+static unsigned
+ftp_delete_progress_percent(const ftp_delete_task_t *task) {
+  if(!task) {
+    return 0;
+  }
+
+  if(task->progress.total_entries == 0) {
+    return 100;
+  }
+
+  uintmax_t deleted = task->progress.deleted_entries;
+  if(deleted > task->progress.total_entries) {
+    deleted = task->progress.total_entries;
+  }
+
+  return (unsigned)((deleted * 100) / task->progress.total_entries);
+}
+
+static void
+ftp_delete_notify_start(ftp_delete_task_t *task) {
+  struct timespec now;
+
+  if(!task) {
+    return;
+  }
+
+  ftp_now(&now);
+  task->progress.last_notify_ts = now;
+  task->progress.has_last_notify_ts = 1;
+  task->progress.last_notify_entries = task->progress.deleted_entries;
+  task->progress.next_check_entries =
+    ftp_saturating_add(task->progress.deleted_entries,
+                       FTP_DELETE_NOTIFY_CHECK_ITEMS);
+  notify("Delete started: %s", task->path_notify);
+}
+
+static void
+ftp_delete_notify_progress(ftp_delete_task_t *task) {
+  struct timespec now;
+  double elapsed;
+  double items_per_sec;
+  uintmax_t deleted_delta;
+  uintmax_t deleted;
+  uintmax_t total;
+  char rate[32];
+
+  if(!task) {
+    return;
+  }
+
+  ftp_now(&now);
+  if(!task->progress.has_last_notify_ts) {
+    task->progress.last_notify_ts = now;
+    task->progress.has_last_notify_ts = 1;
+    task->progress.last_notify_entries = task->progress.deleted_entries;
+    task->progress.next_check_entries =
+      ftp_saturating_add(task->progress.deleted_entries,
+                         FTP_DELETE_NOTIFY_CHECK_ITEMS);
+    return;
+  }
+
+  elapsed = ftp_elapsed_seconds(&task->progress.last_notify_ts, &now);
+  if(elapsed < 10.0) {
+    task->progress.next_check_entries =
+      ftp_saturating_add(task->progress.deleted_entries,
+                         FTP_DELETE_NOTIFY_CHECK_ITEMS);
+    return;
+  }
+
+  deleted_delta =
+    task->progress.deleted_entries - task->progress.last_notify_entries;
+  items_per_sec = elapsed > 0.0 ? (double)deleted_delta / elapsed : 0.0;
+  ftp_delete_format_rate(items_per_sec, rate, sizeof(rate));
+
+  deleted = task->progress.deleted_entries;
+  total = task->progress.total_entries;
+  if(total > 0 && deleted > total) {
+    deleted = total;
+  }
+
+  task->progress.last_notify_ts = now;
+  task->progress.last_notify_entries = task->progress.deleted_entries;
+  task->progress.next_check_entries =
+    ftp_saturating_add(task->progress.deleted_entries,
+                       FTP_DELETE_NOTIFY_CHECK_ITEMS);
+  notify("Delete %u%% (%ju / %ju items) - %s",
+         ftp_delete_progress_percent(task),
+         (uintmax_t)deleted, (uintmax_t)total, rate);
+}
+
+static void
+ftp_delete_progress_add(ftp_delete_task_t *task, uintmax_t amount) {
+  if(!task || amount == 0) {
+    return;
+  }
+
+  task->progress.deleted_entries =
+    ftp_saturating_add(task->progress.deleted_entries, amount);
+
+  if(task->progress.deleted_entries < task->progress.next_check_entries) {
+    return;
+  }
+
+  ftp_delete_notify_progress(task);
+}
+
+static void
+ftp_delete_notify_result(const ftp_delete_task_t *task, int rc, int err) {
+  unsigned pct = rc ? ftp_delete_progress_percent(task) : 100;
+
+  if(rc) {
+    if(err == 0) {
+      err = EIO;
+    }
+    notify("Delete failed %u%%: %s (%s)",
+           pct, task->path_notify, strerror(err));
+    return;
+  }
+
+  notify("Delete finished %u%%: %s (OK)", pct, task->path_notify);
+}
+
 static int
-ftp_rmda_delete_dir(const char *path, int *err_out) {
+ftp_delete_count_dir(const char *path, uintmax_t *count_out) {
+  DIR *dir = opendir(path);
+  struct dirent *ent;
+
+  if(!dir) {
+    return -1;
+  }
+
+  for(;;) {
+    errno = 0;
+    ent = readdir(dir);
+    if(!ent) {
+      if(errno) {
+        int err = errno;
+        closedir(dir);
+        errno = err;
+        return -1;
+      }
+      break;
+    }
+
+    if(ent->d_name[0] == '.' &&
+       (ent->d_name[1] == '\0' ||
+        (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
+      continue;
+    }
+
+    char child[PATH_MAX];
+    struct stat st;
+
+    if(ftp_join_path(child, sizeof(child), path, ent->d_name) != 0) {
+      int err = errno;
+      closedir(dir);
+      errno = err;
+      return -1;
+    }
+    if(lstat(child, &st) != 0) {
+      int err = errno;
+      closedir(dir);
+      errno = err;
+      return -1;
+    }
+
+    if(S_ISDIR(st.st_mode)) {
+      if(ftp_delete_count_dir(child, count_out) != 0) {
+        int err = errno;
+        closedir(dir);
+        errno = err;
+        return -1;
+      }
+    } else if(!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) {
+      int err = EINVAL;
+      closedir(dir);
+      errno = err;
+      return -1;
+    }
+
+    *count_out = ftp_saturating_add(*count_out, 1);
+  }
+
+  if(closedir(dir) != 0) {
+    return -1;
+  }
+
+  *count_out = ftp_saturating_add(*count_out, 1);
+  return 0;
+}
+
+static int
+ftp_rmda_delete_dir(const char *path, int *err_out, ftp_delete_task_t *task) {
   DIR *dir = opendir(path);
   if(!dir) {
     if(!*err_out) {
@@ -1590,7 +1902,7 @@ ftp_rmda_delete_dir(const char *path, int *err_out) {
     }
 
     if(S_ISDIR(st.st_mode)) {
-      if(ftp_rmda_delete_dir(child, err_out)) {
+      if(ftp_rmda_delete_dir(child, err_out, task)) {
         failed = 1;
       }
       continue;
@@ -1601,6 +1913,8 @@ ftp_rmda_delete_dir(const char *path, int *err_out) {
         *err_out = errno;
       }
       failed = 1;
+    } else {
+      ftp_delete_progress_add(task, 1);
     }
   }
 
@@ -1622,7 +1936,119 @@ ftp_rmda_delete_dir(const char *path, int *err_out) {
     return -1;
   }
 
+  ftp_delete_progress_add(task, 1);
+
   return 0;
+}
+
+static ftp_delete_task_t*
+ftp_delete_create_task(ftp_env_t *env, const char *path) {
+  ftp_delete_task_t *task;
+
+  if(!env || !path) {
+    errno = EINVAL;
+    return NULL;
+  }
+
+  task = calloc(1, sizeof(*task));
+  if(!task) {
+    return NULL;
+  }
+
+  task->env = env;
+  snprintf(task->path, sizeof(task->path), "%s", path);
+  ftp_compact_path(path, task->path_notify, sizeof(task->path_notify));
+  return task;
+}
+
+static void
+ftp_delete_thread_cleanup(ftp_env_t *env) {
+  pthread_t thread;
+  int should_join = 0;
+
+  pthread_mutex_lock(&env->delete_mutex);
+  if(env->delete_thread_valid && !env->delete_in_progress) {
+    thread = env->delete_thread;
+    env->delete_thread_valid = 0;
+    should_join = 1;
+  }
+  pthread_mutex_unlock(&env->delete_mutex);
+
+  if(should_join) {
+    pthread_join(thread, NULL);
+  }
+}
+
+static int
+ftp_bg_op_busy(ftp_env_t *env) {
+  int busy;
+
+  pthread_mutex_lock(&env->copy_mutex);
+  busy = env->copy_in_progress;
+  pthread_mutex_unlock(&env->copy_mutex);
+  if(busy) {
+    return 1;
+  }
+
+  pthread_mutex_lock(&env->delete_mutex);
+  busy = env->delete_in_progress;
+  pthread_mutex_unlock(&env->delete_mutex);
+
+  return busy;
+}
+
+static int
+ftp_delete_start_task(ftp_env_t *env, ftp_delete_task_t *task) {
+  int thread_rc;
+
+  pthread_mutex_lock(&env->delete_mutex);
+  env->delete_in_progress = 1;
+  env->delete_thread_valid = 1;
+  pthread_mutex_unlock(&env->delete_mutex);
+
+  thread_rc = pthread_create(&env->delete_thread, NULL,
+                             ftp_delete_thread, task);
+  if(thread_rc != 0) {
+    pthread_mutex_lock(&env->delete_mutex);
+    env->delete_in_progress = 0;
+    env->delete_thread_valid = 0;
+    pthread_mutex_unlock(&env->delete_mutex);
+    free(task);
+    errno = thread_rc;
+    return ftp_perror(env);
+  }
+
+  return ftp_active_printf(env, "250 Delete started in background\r\n");
+}
+
+static void *
+ftp_delete_thread(void *arg) {
+  ftp_delete_task_t *task = (ftp_delete_task_t *)arg;
+  ftp_env_t *env = task->env;
+  int err = 0;
+  int rc;
+
+  ftp_delete_notify_start(task);
+
+  rc = ftp_delete_count_dir(task->path, &task->progress.total_entries);
+  if(rc == 0) {
+    rc = ftp_rmda_delete_dir(task->path, &err, task);
+  } else {
+    err = errno;
+  }
+
+  if(rc != 0 && err == 0) {
+    err = errno;
+  }
+
+  ftp_delete_notify_result(task, rc, err);
+
+  pthread_mutex_lock(&env->delete_mutex);
+  env->delete_in_progress = 0;
+  pthread_mutex_unlock(&env->delete_mutex);
+
+  free(task);
+  return NULL;
 }
 
 typedef struct {
@@ -2592,10 +3018,16 @@ int
 ftp_cmd_RMDA(ftp_env_t *env, const char* arg) {
   char pathbuf[PATH_MAX];
   struct stat st;
-  int err = 0;
+  ftp_delete_task_t *task;
 
   if(!arg[0]) {
     return ftp_active_printf(env, "501 Usage: RMDA <DIRNAME>\r\n");
+  }
+
+  ftp_copy_thread_cleanup(env);
+  ftp_delete_thread_cleanup(env);
+  if(ftp_bg_op_busy(env)) {
+    return ftp_active_printf(env, "450 Background file operation in progress\r\n");
   }
 
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), arg)) {
@@ -2613,14 +3045,12 @@ ftp_cmd_RMDA(ftp_env_t *env, const char* arg) {
     return ftp_active_printf(env, "550 %s: Not a directory.\r\n", arg);
   }
 
-  if(ftp_rmda_delete_dir(pathbuf, &err)) {
-    if(err) {
-      errno = err;
-    }
-    return ftp_active_printf(env, "550 %s: %s.\r\n", arg, strerror(errno));
+  task = ftp_delete_create_task(env, pathbuf);
+  if(!task) {
+    return ftp_perror(env);
   }
 
-  return ftp_active_printf(env, "250 RMDA command successful.\r\n");
+  return ftp_delete_start_task(env, task);
 }
 
 
@@ -2784,7 +3214,6 @@ typedef enum {
   FTP_COPY_SYMLINK,
 } ftp_copy_kind_t;
 
-#define FTP_COPY_NOTIFY_PATH_SIZE 224
 #define FTP_COPY_NOTIFY_CHECK_BYTES (4 * 1024 * 1024)
 
 typedef struct {
@@ -2801,45 +3230,10 @@ typedef struct {
   ftp_copy_kind_t kind;
   char src[PATH_MAX];
   char dst[PATH_MAX];
-  char src_notify[FTP_COPY_NOTIFY_PATH_SIZE];
-  char dst_notify[FTP_COPY_NOTIFY_PATH_SIZE];
+  char src_notify[FTP_NOTIFY_PATH_SIZE];
+  char dst_notify[FTP_NOTIFY_PATH_SIZE];
   ftp_copy_progress_t progress;
 } ftp_copy_task_t;
-
-static void
-ftp_copy_compact_path(const char *path, char *out, size_t out_size) {
-  size_t len;
-  size_t head;
-  size_t tail;
-
-  if(!out || out_size == 0) {
-    return;
-  }
-
-  out[0] = '\0';
-  if(!path) {
-    return;
-  }
-
-  len = strlen(path);
-  if(len + 1 <= out_size) {
-    memcpy(out, path, len + 1);
-    return;
-  }
-
-  if(out_size < 5) {
-    strncpy(out, path, out_size - 1);
-    out[out_size - 1] = '\0';
-    return;
-  }
-
-  head = (out_size - 4) / 2;
-  tail = out_size - 4 - head;
-  memcpy(out, path, head);
-  memcpy(out + head, "...", 3);
-  memcpy(out + head + 3, path + len - tail, tail);
-  out[out_size - 1] = '\0';
-}
 
 static ftp_copy_task_t*
 ftp_copy_create_task(ftp_env_t *env, ftp_copy_kind_t kind,
@@ -2862,55 +3256,10 @@ ftp_copy_create_task(ftp_env_t *env, ftp_copy_kind_t kind,
   task->progress.total_bytes = total_bytes;
   snprintf(task->src, sizeof(task->src), "%s", src);
   snprintf(task->dst, sizeof(task->dst), "%s", dst);
-  ftp_copy_compact_path(src, task->src_notify, sizeof(task->src_notify));
-  ftp_copy_compact_path(dst, task->dst_notify, sizeof(task->dst_notify));
+  ftp_compact_path(src, task->src_notify, sizeof(task->src_notify));
+  ftp_compact_path(dst, task->dst_notify, sizeof(task->dst_notify));
 
   return task;
-}
-
-static uintmax_t
-ftp_copy_saturating_add(uintmax_t lhs, uintmax_t rhs) {
-  if(UINTMAX_MAX - lhs < rhs) {
-    return UINTMAX_MAX;
-  }
-
-  return lhs + rhs;
-}
-
-static void
-ftp_copy_now(struct timespec *ts) {
-  if(!ts) {
-    return;
-  }
-
-#ifdef CLOCK_MONOTONIC
-  if(clock_gettime(CLOCK_MONOTONIC, ts) == 0) {
-    return;
-  }
-#endif
-
-  ts->tv_sec = time(NULL);
-  ts->tv_nsec = 0;
-}
-
-static double
-ftp_copy_elapsed_seconds(const struct timespec *start,
-                         const struct timespec *end) {
-  time_t sec;
-  long nsec;
-
-  if(!start || !end) {
-    return 0.0;
-  }
-
-  sec = end->tv_sec - start->tv_sec;
-  nsec = end->tv_nsec - start->tv_nsec;
-  if(nsec < 0) {
-    sec -= 1;
-    nsec += 1000000000L;
-  }
-
-  return (double)sec + ((double)nsec / 1000000000.0);
 }
 
 static void
@@ -3008,13 +3357,13 @@ ftp_copy_notify_start(ftp_copy_task_t *task) {
     return;
   }
 
-  ftp_copy_now(&now);
+  ftp_now(&now);
   task->progress.last_notify_ts = now;
   task->progress.has_last_notify_ts = 1;
   task->progress.last_notify_bytes = task->progress.copied_bytes;
   task->progress.next_check_bytes =
-    ftp_copy_saturating_add(task->progress.copied_bytes,
-                            FTP_COPY_NOTIFY_CHECK_BYTES);
+    ftp_saturating_add(task->progress.copied_bytes,
+                       FTP_COPY_NOTIFY_CHECK_BYTES);
   notify("Copy started: %s -> %s", task->src_notify, task->dst_notify);
 }
 
@@ -3034,22 +3383,22 @@ ftp_copy_notify_progress(ftp_copy_task_t *task) {
     return;
   }
 
-  ftp_copy_now(&now);
+  ftp_now(&now);
   if(!task->progress.has_last_notify_ts) {
     task->progress.last_notify_ts = now;
     task->progress.has_last_notify_ts = 1;
     task->progress.last_notify_bytes = task->progress.copied_bytes;
     task->progress.next_check_bytes =
-      ftp_copy_saturating_add(task->progress.copied_bytes,
-                              FTP_COPY_NOTIFY_CHECK_BYTES);
+      ftp_saturating_add(task->progress.copied_bytes,
+                         FTP_COPY_NOTIFY_CHECK_BYTES);
     return;
   }
 
-  elapsed = ftp_copy_elapsed_seconds(&task->progress.last_notify_ts, &now);
+  elapsed = ftp_elapsed_seconds(&task->progress.last_notify_ts, &now);
   if(elapsed < 10.0) {
     task->progress.next_check_bytes =
-      ftp_copy_saturating_add(task->progress.copied_bytes,
-                              FTP_COPY_NOTIFY_CHECK_BYTES);
+      ftp_saturating_add(task->progress.copied_bytes,
+                         FTP_COPY_NOTIFY_CHECK_BYTES);
     return;
   }
 
@@ -3068,8 +3417,8 @@ ftp_copy_notify_progress(ftp_copy_task_t *task) {
   task->progress.last_notify_ts = now;
   task->progress.last_notify_bytes = task->progress.copied_bytes;
   task->progress.next_check_bytes =
-    ftp_copy_saturating_add(task->progress.copied_bytes,
-                            FTP_COPY_NOTIFY_CHECK_BYTES);
+    ftp_saturating_add(task->progress.copied_bytes,
+                       FTP_COPY_NOTIFY_CHECK_BYTES);
   notify("Copy %u%% (%s / %s) - %s",
          ftp_copy_progress_percent(task), copied_str, total_str, speed);
 }
@@ -3080,11 +3429,8 @@ ftp_copy_progress_add(ftp_copy_task_t *task, uintmax_t amount) {
     return;
   }
 
-  if(UINTMAX_MAX - task->progress.copied_bytes < amount) {
-    task->progress.copied_bytes = UINTMAX_MAX;
-  } else {
-    task->progress.copied_bytes += amount;
-  }
+  task->progress.copied_bytes =
+    ftp_saturating_add(task->progress.copied_bytes, amount);
 
   if(task->progress.copied_bytes < task->progress.next_check_bytes) {
     return;
@@ -3530,11 +3876,9 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
   uintmax_t total_bytes = 0;
 
   ftp_copy_thread_cleanup(env);
-  pthread_mutex_lock(&env->copy_mutex);
-  int busy = env->copy_in_progress;
-  pthread_mutex_unlock(&env->copy_mutex);
-  if(busy) {
-    return ftp_active_printf(env, "450 Copy in progress\r\n");
+  ftp_delete_thread_cleanup(env);
+  if(ftp_bg_op_busy(env)) {
+    return ftp_active_printf(env, "450 Background file operation in progress\r\n");
   }
 
   path_arg = ftp_copy_path_arg(arg, argbuf, sizeof(argbuf));
@@ -3652,11 +3996,9 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
   uintmax_t total_bytes = 0;
 
   ftp_copy_thread_cleanup(env);
-  pthread_mutex_lock(&env->copy_mutex);
-  int busy = env->copy_in_progress;
-  pthread_mutex_unlock(&env->copy_mutex);
-  if(busy) {
-    return ftp_active_printf(env, "450 Copy in progress\r\n");
+  ftp_delete_thread_cleanup(env);
+  if(ftp_bg_op_busy(env)) {
+    return ftp_active_printf(env, "450 Background file operation in progress\r\n");
   }
 
   if(ftp_split_copy_args(arg, src_arg, sizeof(src_arg),

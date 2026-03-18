@@ -338,9 +338,12 @@ ftp_thread(void *args) {
   env.copy_ready = 0;
   env.copy_in_progress = 0;
   env.copy_thread_valid = 0;
+  env.delete_in_progress = 0;
+  env.delete_thread_valid = 0;
 
   pthread_mutex_init(&env.ctrl_mutex, NULL);
   pthread_mutex_init(&env.copy_mutex, NULL);
+  pthread_mutex_init(&env.delete_mutex, NULL);
 
   strcpy(env.cwd, "/");
   memset(env.rename_path, 0, sizeof(env.rename_path));
@@ -387,6 +390,9 @@ ftp_thread(void *args) {
   if(env.copy_thread_valid) {
     pthread_join(env.copy_thread, NULL);
   }
+  if(env.delete_thread_valid) {
+    pthread_join(env.delete_thread, NULL);
+  }
 
   if(env.active_fd >= 0) {
     close(env.active_fd);
@@ -405,6 +411,7 @@ ftp_thread(void *args) {
   }
 
   pthread_mutex_destroy(&env.copy_mutex);
+  pthread_mutex_destroy(&env.delete_mutex);
   pthread_mutex_destroy(&env.ctrl_mutex);
 
   pthread_exit(NULL);
