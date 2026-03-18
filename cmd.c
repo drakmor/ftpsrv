@@ -1468,7 +1468,19 @@ ftp_dir_size(const char *path, uintmax_t *size_out) {
   }
 
   struct dirent *ent;
-  while((ent = readdir(dir)) != NULL) {
+  for(;;) {
+    errno = 0;
+    ent = readdir(dir);
+    if(!ent) {
+      if(errno) {
+        int err = errno;
+        closedir(dir);
+        errno = err;
+        return -1;
+      }
+      break;
+    }
+
     if(ent->d_name[0] == '.' &&
        (ent->d_name[1] == '\0' ||
         (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
@@ -1539,7 +1551,19 @@ ftp_rmda_delete_dir(const char *path, int *err_out) {
 
   int failed = 0;
   struct dirent *ent;
-  while((ent = readdir(dir)) != NULL) {
+  for(;;) {
+    errno = 0;
+    ent = readdir(dir);
+    if(!ent) {
+      if(errno && !*err_out) {
+        *err_out = errno;
+      }
+      if(errno) {
+        failed = 1;
+      }
+      break;
+    }
+
     if(ent->d_name[0] == '.' &&
        (ent->d_name[1] == '\0' ||
         (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
@@ -2961,6 +2985,7 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
   struct dirent *ent = NULL;
   struct stat st;
   int res = 0;
+  int saved_errno = 0;
 
   if(lstat(dst_dir, &st) == 0) {
     if(!S_ISDIR(st.st_mode)) {
@@ -2980,7 +3005,17 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
     return -1;
   }
 
-  while((ent = readdir(dir)) != NULL) {
+  for(;;) {
+    errno = 0;
+    ent = readdir(dir);
+    if(!ent) {
+      if(errno) {
+        saved_errno = errno;
+        res = -1;
+      }
+      break;
+    }
+
     if(ent->d_name[0] == '.' &&
        (ent->d_name[1] == '\0' ||
         (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
@@ -2991,38 +3026,50 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
     char dst_path[PATH_MAX];
     if(ftp_join_path(src_path, sizeof(src_path), src_dir, ent->d_name) != 0 ||
        ftp_join_path(dst_path, sizeof(dst_path), dst_dir, ent->d_name) != 0) {
+      saved_errno = errno;
       res = -1;
       break;
     }
 
     if(lstat(src_path, &st)) {
+      saved_errno = errno;
       res = -1;
       break;
     }
     if(S_ISDIR(st.st_mode)) {
       if(ftp_copy_dir(src_path, dst_path, buf, bufsize)) {
+        saved_errno = errno;
         res = -1;
         break;
       }
     } else if(S_ISREG(st.st_mode)) {
       if(ftp_copy_file(src_path, dst_path, buf, bufsize)) {
+        saved_errno = errno;
         res = -1;
         break;
       }
     } else if(S_ISLNK(st.st_mode)) {
       if(ftp_copy_symlink(src_path, dst_path)) {
+        saved_errno = errno;
         res = -1;
         break;
       }
       ftp_copy_symlink_metadata(src_path, dst_path);
     } else {
       errno = EINVAL;
+      saved_errno = errno;
       res = -1;
       break;
     }
   }
 
-  closedir(dir);
+  if(closedir(dir) && !saved_errno) {
+    saved_errno = errno;
+    res = -1;
+  }
+  if(saved_errno) {
+    errno = saved_errno;
+  }
   if(res == 0) {
     if(ftp_copy_metadata(src_dir, dst_dir)) {
       return -1;
