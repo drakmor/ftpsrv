@@ -42,6 +42,7 @@ along with this program; see the file COPYING. If not, see
 #include "cmd.h"
 #include "io.h"
 #include "log.h"
+#include "notify.h"
 #include "self.h"
 
 #ifndef FTP_LIST_OUTBUF_SIZE
@@ -2783,12 +2784,354 @@ typedef enum {
   FTP_COPY_SYMLINK,
 } ftp_copy_kind_t;
 
+#define FTP_COPY_NOTIFY_PATH_SIZE 224
+#define FTP_COPY_NOTIFY_CHECK_BYTES (4 * 1024 * 1024)
+
+typedef struct {
+  uintmax_t total_bytes;
+  uintmax_t copied_bytes;
+  uintmax_t last_notify_bytes;
+  uintmax_t next_check_bytes;
+  struct timespec last_notify_ts;
+  int has_last_notify_ts;
+} ftp_copy_progress_t;
+
 typedef struct {
   ftp_env_t *env;
   ftp_copy_kind_t kind;
   char src[PATH_MAX];
   char dst[PATH_MAX];
+  char src_notify[FTP_COPY_NOTIFY_PATH_SIZE];
+  char dst_notify[FTP_COPY_NOTIFY_PATH_SIZE];
+  ftp_copy_progress_t progress;
 } ftp_copy_task_t;
+
+static void
+ftp_copy_compact_path(const char *path, char *out, size_t out_size) {
+  size_t len;
+  size_t head;
+  size_t tail;
+
+  if(!out || out_size == 0) {
+    return;
+  }
+
+  out[0] = '\0';
+  if(!path) {
+    return;
+  }
+
+  len = strlen(path);
+  if(len + 1 <= out_size) {
+    memcpy(out, path, len + 1);
+    return;
+  }
+
+  if(out_size < 5) {
+    strncpy(out, path, out_size - 1);
+    out[out_size - 1] = '\0';
+    return;
+  }
+
+  head = (out_size - 4) / 2;
+  tail = out_size - 4 - head;
+  memcpy(out, path, head);
+  memcpy(out + head, "...", 3);
+  memcpy(out + head + 3, path + len - tail, tail);
+  out[out_size - 1] = '\0';
+}
+
+static ftp_copy_task_t*
+ftp_copy_create_task(ftp_env_t *env, ftp_copy_kind_t kind,
+                     const char *src, const char *dst,
+                     uintmax_t total_bytes) {
+  ftp_copy_task_t *task;
+
+  if(!env || !src || !dst) {
+    errno = EINVAL;
+    return NULL;
+  }
+
+  task = calloc(1, sizeof(*task));
+  if(!task) {
+    return NULL;
+  }
+
+  task->env = env;
+  task->kind = kind;
+  task->progress.total_bytes = total_bytes;
+  snprintf(task->src, sizeof(task->src), "%s", src);
+  snprintf(task->dst, sizeof(task->dst), "%s", dst);
+  ftp_copy_compact_path(src, task->src_notify, sizeof(task->src_notify));
+  ftp_copy_compact_path(dst, task->dst_notify, sizeof(task->dst_notify));
+
+  return task;
+}
+
+static uintmax_t
+ftp_copy_saturating_add(uintmax_t lhs, uintmax_t rhs) {
+  if(UINTMAX_MAX - lhs < rhs) {
+    return UINTMAX_MAX;
+  }
+
+  return lhs + rhs;
+}
+
+static void
+ftp_copy_now(struct timespec *ts) {
+  if(!ts) {
+    return;
+  }
+
+#ifdef CLOCK_MONOTONIC
+  if(clock_gettime(CLOCK_MONOTONIC, ts) == 0) {
+    return;
+  }
+#endif
+
+  ts->tv_sec = time(NULL);
+  ts->tv_nsec = 0;
+}
+
+static double
+ftp_copy_elapsed_seconds(const struct timespec *start,
+                         const struct timespec *end) {
+  time_t sec;
+  long nsec;
+
+  if(!start || !end) {
+    return 0.0;
+  }
+
+  sec = end->tv_sec - start->tv_sec;
+  nsec = end->tv_nsec - start->tv_nsec;
+  if(nsec < 0) {
+    sec -= 1;
+    nsec += 1000000000L;
+  }
+
+  return (double)sec + ((double)nsec / 1000000000.0);
+}
+
+static void
+ftp_copy_format_bytes(double bytes, const char *const *units, size_t unit_count,
+                      char *out, size_t out_size) {
+  size_t unit = 0;
+  double value = bytes;
+
+  if(!out || out_size == 0) {
+    return;
+  }
+
+  if(value < 0.0) {
+    value = 0.0;
+  }
+
+  while(value >= 1024.0 && unit + 1 < unit_count) {
+    value /= 1024.0;
+    unit += 1;
+  }
+
+  if(unit == 0 || value >= 100.0) {
+    snprintf(out, out_size, "%.0f %s", value, units[unit]);
+  } else if(value >= 10.0) {
+    snprintf(out, out_size, "%.1f %s", value, units[unit]);
+  } else {
+    snprintf(out, out_size, "%.2f %s", value, units[unit]);
+  }
+}
+
+static void
+ftp_copy_format_size(uintmax_t bytes, char *out, size_t out_size) {
+  static const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+
+  ftp_copy_format_bytes((double)bytes, units,
+                        sizeof(units) / sizeof(units[0]), out, out_size);
+}
+
+static void
+ftp_copy_format_speed(double bytes_per_sec, char *out, size_t out_size) {
+  static const char *units[] = {"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"};
+
+  ftp_copy_format_bytes(bytes_per_sec, units,
+                        sizeof(units) / sizeof(units[0]), out, out_size);
+}
+
+static int
+ftp_copy_total_for_stat(const char *path, const struct stat *st,
+                        uintmax_t *total_out) {
+  uintmax_t total = 0;
+
+  if(!path || !st || !total_out) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if(S_ISREG(st->st_mode) || S_ISLNK(st->st_mode)) {
+    total = (uintmax_t)st->st_size;
+  } else if(S_ISDIR(st->st_mode)) {
+    if(ftp_dir_size(path, &total)) {
+      return -1;
+    }
+  } else {
+    errno = EINVAL;
+    return -1;
+  }
+
+  *total_out = total;
+  return 0;
+}
+
+static unsigned
+ftp_copy_progress_percent(const ftp_copy_task_t *task) {
+  if(!task) {
+    return 0;
+  }
+
+  if(task->progress.total_bytes == 0) {
+    return 100;
+  }
+
+  uintmax_t copied = task->progress.copied_bytes;
+  if(copied > task->progress.total_bytes) {
+    copied = task->progress.total_bytes;
+  }
+
+  return (unsigned)((copied * 100) / task->progress.total_bytes);
+}
+
+static void
+ftp_copy_notify_start(ftp_copy_task_t *task) {
+  struct timespec now;
+
+  if(!task) {
+    return;
+  }
+
+  ftp_copy_now(&now);
+  task->progress.last_notify_ts = now;
+  task->progress.has_last_notify_ts = 1;
+  task->progress.last_notify_bytes = task->progress.copied_bytes;
+  task->progress.next_check_bytes =
+    ftp_copy_saturating_add(task->progress.copied_bytes,
+                            FTP_COPY_NOTIFY_CHECK_BYTES);
+  notify("Copy started: %s -> %s", task->src_notify, task->dst_notify);
+}
+
+static void
+ftp_copy_notify_progress(ftp_copy_task_t *task) {
+  struct timespec now;
+  double elapsed;
+  double bytes_per_sec;
+  uintmax_t bytes_delta;
+  uintmax_t copied;
+  uintmax_t total;
+  char copied_str[32];
+  char total_str[32];
+  char speed[32];
+
+  if(!task) {
+    return;
+  }
+
+  ftp_copy_now(&now);
+  if(!task->progress.has_last_notify_ts) {
+    task->progress.last_notify_ts = now;
+    task->progress.has_last_notify_ts = 1;
+    task->progress.last_notify_bytes = task->progress.copied_bytes;
+    task->progress.next_check_bytes =
+      ftp_copy_saturating_add(task->progress.copied_bytes,
+                              FTP_COPY_NOTIFY_CHECK_BYTES);
+    return;
+  }
+
+  elapsed = ftp_copy_elapsed_seconds(&task->progress.last_notify_ts, &now);
+  if(elapsed < 10.0) {
+    task->progress.next_check_bytes =
+      ftp_copy_saturating_add(task->progress.copied_bytes,
+                              FTP_COPY_NOTIFY_CHECK_BYTES);
+    return;
+  }
+
+  bytes_delta = task->progress.copied_bytes - task->progress.last_notify_bytes;
+  bytes_per_sec = elapsed > 0.0 ? (double)bytes_delta / elapsed : 0.0;
+  copied = task->progress.copied_bytes;
+  total = task->progress.total_bytes;
+  if(total > 0 && copied > total) {
+    copied = total;
+  }
+
+  ftp_copy_format_size(copied, copied_str, sizeof(copied_str));
+  ftp_copy_format_size(total, total_str, sizeof(total_str));
+  ftp_copy_format_speed(bytes_per_sec, speed, sizeof(speed));
+
+  task->progress.last_notify_ts = now;
+  task->progress.last_notify_bytes = task->progress.copied_bytes;
+  task->progress.next_check_bytes =
+    ftp_copy_saturating_add(task->progress.copied_bytes,
+                            FTP_COPY_NOTIFY_CHECK_BYTES);
+  notify("Copy %u%% (%s / %s) - %s",
+         ftp_copy_progress_percent(task), copied_str, total_str, speed);
+}
+
+static void
+ftp_copy_progress_add(ftp_copy_task_t *task, uintmax_t amount) {
+  if(!task || amount == 0) {
+    return;
+  }
+
+  if(UINTMAX_MAX - task->progress.copied_bytes < amount) {
+    task->progress.copied_bytes = UINTMAX_MAX;
+  } else {
+    task->progress.copied_bytes += amount;
+  }
+
+  if(task->progress.copied_bytes < task->progress.next_check_bytes) {
+    return;
+  }
+
+  ftp_copy_notify_progress(task);
+}
+
+static void
+ftp_copy_notify_result(const ftp_copy_task_t *task, int rc, int err) {
+  unsigned pct = rc ? ftp_copy_progress_percent(task) : 100;
+
+  if(rc) {
+    if(err == 0) {
+      err = EIO;
+    }
+    notify("Copy failed %u%%: %s -> %s (%s)",
+           pct, task->src_notify, task->dst_notify, strerror(err));
+    return;
+  }
+
+  notify("Copy finished %u%%: %s -> %s (OK)",
+         pct, task->src_notify, task->dst_notify);
+}
+
+static int
+ftp_copy_start_task(ftp_env_t *env, ftp_copy_task_t *task) {
+  int thread_rc;
+
+  pthread_mutex_lock(&env->copy_mutex);
+  env->copy_in_progress = 1;
+  env->copy_thread_valid = 1;
+  pthread_mutex_unlock(&env->copy_mutex);
+
+  thread_rc = pthread_create(&env->copy_thread, NULL, ftp_copy_thread, task);
+  if(thread_rc != 0) {
+    pthread_mutex_lock(&env->copy_mutex);
+    env->copy_in_progress = 0;
+    env->copy_thread_valid = 0;
+    pthread_mutex_unlock(&env->copy_mutex);
+    free(task);
+    errno = thread_rc;
+    return ftp_perror(env);
+  }
+
+  return ftp_active_printf(env, "250 Copy started in background\r\n");
+}
 
 /**
  * Copy file metadata (mode, owner, group, timestamps) from src to dst.
@@ -2896,7 +3239,7 @@ ftp_mkdirs_parent(const char *path) {
  **/
 static int
 ftp_copy_file(const char *src_path, const char *dst_path,
-              void *buf, size_t bufsize) {
+              void *buf, size_t bufsize, ftp_copy_task_t *task) {
 #ifdef O_CLOEXEC
   int src_flags = O_RDONLY | O_CLOEXEC;
 #else
@@ -2962,6 +3305,7 @@ ftp_copy_file(const char *src_path, const char *dst_path,
       close(dst_fd);
       return -1;
     }
+    ftp_copy_progress_add(task, (uintmax_t)r);
   }
 
   if(free_buf) {
@@ -2980,7 +3324,7 @@ ftp_copy_file(const char *src_path, const char *dst_path,
  **/
 static int
 ftp_copy_dir(const char *src_dir, const char *dst_dir,
-             void *buf, size_t bufsize) {
+             void *buf, size_t bufsize, ftp_copy_task_t *task) {
   DIR *dir = NULL;
   struct dirent *ent = NULL;
   struct stat st;
@@ -3037,13 +3381,13 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
       break;
     }
     if(S_ISDIR(st.st_mode)) {
-      if(ftp_copy_dir(src_path, dst_path, buf, bufsize)) {
+      if(ftp_copy_dir(src_path, dst_path, buf, bufsize, task)) {
         saved_errno = errno;
         res = -1;
         break;
       }
     } else if(S_ISREG(st.st_mode)) {
-      if(ftp_copy_file(src_path, dst_path, buf, bufsize)) {
+      if(ftp_copy_file(src_path, dst_path, buf, bufsize, task)) {
         saved_errno = errno;
         res = -1;
         break;
@@ -3055,6 +3399,7 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
         break;
       }
       ftp_copy_symlink_metadata(src_path, dst_path);
+      ftp_copy_progress_add(task, (uintmax_t)st.st_size);
     } else {
       errno = EINVAL;
       saved_errno = errno;
@@ -3107,8 +3452,22 @@ ftp_copy_thread(void *arg) {
   ftp_copy_task_t *task = (ftp_copy_task_t *)arg;
   ftp_env_t *env = task->env;
   int rc = 0;
+  int saved_errno = 0;
   void *buf = NULL;
   size_t bufsize = 0;
+
+  ftp_copy_notify_start(task);
+
+  if(task->kind == FTP_COPY_DIR && task->progress.total_bytes == 0) {
+    struct stat st;
+
+    if(lstat(task->src, &st)) {
+      rc = -1;
+    } else if(ftp_copy_total_for_stat(task->src, &st,
+                                      &task->progress.total_bytes)) {
+      rc = -1;
+    }
+  }
 
   if(task->kind == FTP_COPY_REG || task->kind == FTP_COPY_DIR) {
     bufsize = IO_COPY_BUFSIZE;
@@ -3122,25 +3481,33 @@ ftp_copy_thread(void *arg) {
   if(!rc) {
     switch(task->kind) {
       case FTP_COPY_REG:
-        rc = ftp_copy_file(task->src, task->dst, buf, bufsize);
+        rc = ftp_copy_file(task->src, task->dst, buf, bufsize, task);
         break;
       case FTP_COPY_DIR:
-        rc = ftp_copy_dir(task->src, task->dst, buf, bufsize);
+        rc = ftp_copy_dir(task->src, task->dst, buf, bufsize, task);
         break;
       case FTP_COPY_SYMLINK:
         rc = ftp_copy_symlink(task->src, task->dst);
         if(!rc) {
+          struct stat st;
+          if(lstat(task->src, &st) == 0) {
+            ftp_copy_progress_add(task, (uintmax_t)st.st_size);
+          }
           ftp_copy_symlink_metadata(task->src, task->dst);
         }
         break;
     }
   }
 
+  if(rc) {
+    saved_errno = errno;
+  }
+
   if(buf) {
     free(buf);
   }
 
-  (void)rc;
+  ftp_copy_notify_result(task, rc, saved_errno);
 
   pthread_mutex_lock(&env->copy_mutex);
   env->copy_in_progress = 0;
@@ -3157,8 +3524,10 @@ int
 ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
   char pathbuf[PATH_MAX];
   char argbuf[PATH_MAX + 1];
+  struct stat src_st;
   struct stat st;
   const char *path_arg = NULL;
+  uintmax_t total_bytes = 0;
 
   ftp_copy_thread_cleanup(env);
   pthread_mutex_lock(&env->copy_mutex);
@@ -3177,8 +3546,11 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
   }
   env->copy_ready = 0;
 
-  if(lstat(env->copy_path, &st)) {
+  if(lstat(env->copy_path, &src_st)) {
     return ftp_perror(env);
+  }
+  if(S_ISREG(src_st.st_mode) || S_ISLNK(src_st.st_mode)) {
+    total_bytes = (uintmax_t)src_st.st_size;
   }
 
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), path_arg)) {
@@ -3188,7 +3560,9 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
     return ftp_active_printf(env, "553 Source and destination are the same\r\n");
   }
 
-  if(S_ISREG(st.st_mode)) {
+  if(S_ISREG(src_st.st_mode)) {
+    ftp_copy_task_t *task;
+
     if(ftp_mkdirs_parent(pathbuf)) {
       return ftp_perror(env);
     }
@@ -3200,36 +3574,17 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
       return ftp_perror(env);
     }
 
-    ftp_copy_task_t *task = calloc(1, sizeof(*task));
+    task = ftp_copy_create_task(env, FTP_COPY_REG,
+                                env->copy_path, pathbuf, total_bytes);
     if(!task) {
       return ftp_perror(env);
     }
-    task->env = env;
-    task->kind = FTP_COPY_REG;
-    strncpy(task->src, env->copy_path, sizeof(task->src) - 1);
-    strncpy(task->dst, pathbuf, sizeof(task->dst) - 1);
-
-    pthread_mutex_lock(&env->copy_mutex);
-    env->copy_in_progress = 1;
-    env->copy_thread_valid = 1;
-    pthread_mutex_unlock(&env->copy_mutex);
-
-    int thread_rc = pthread_create(&env->copy_thread, NULL,
-                                   ftp_copy_thread, task);
-    if(thread_rc != 0) {
-      pthread_mutex_lock(&env->copy_mutex);
-      env->copy_in_progress = 0;
-      env->copy_thread_valid = 0;
-      pthread_mutex_unlock(&env->copy_mutex);
-      free(task);
-      errno = thread_rc;
-      return ftp_perror(env);
-    }
-
-    return ftp_active_printf(env, "250 Copy started in background\r\n");
+    return ftp_copy_start_task(env, task);
   }
 
-  if(S_ISDIR(st.st_mode)) {
+  if(S_ISDIR(src_st.st_mode)) {
+    ftp_copy_task_t *task;
+
     size_t src_len = strlen(env->copy_path);
     if(strncmp(pathbuf, env->copy_path, src_len) == 0 &&
        (pathbuf[src_len] == '/' || pathbuf[src_len] == '\0')) {
@@ -3246,36 +3601,17 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
       return ftp_perror(env);
     }
 
-    ftp_copy_task_t *task = calloc(1, sizeof(*task));
+    task = ftp_copy_create_task(env, FTP_COPY_DIR,
+                                env->copy_path, pathbuf, total_bytes);
     if(!task) {
       return ftp_perror(env);
     }
-    task->env = env;
-    task->kind = FTP_COPY_DIR;
-    strncpy(task->src, env->copy_path, sizeof(task->src) - 1);
-    strncpy(task->dst, pathbuf, sizeof(task->dst) - 1);
-
-    pthread_mutex_lock(&env->copy_mutex);
-    env->copy_in_progress = 1;
-    env->copy_thread_valid = 1;
-    pthread_mutex_unlock(&env->copy_mutex);
-
-    int thread_rc = pthread_create(&env->copy_thread, NULL,
-                                   ftp_copy_thread, task);
-    if(thread_rc != 0) {
-      pthread_mutex_lock(&env->copy_mutex);
-      env->copy_in_progress = 0;
-      env->copy_thread_valid = 0;
-      pthread_mutex_unlock(&env->copy_mutex);
-      free(task);
-      errno = thread_rc;
-      return ftp_perror(env);
-    }
-
-    return ftp_active_printf(env, "250 Copy started in background\r\n");
+    return ftp_copy_start_task(env, task);
   }
 
-  if(S_ISLNK(st.st_mode)) {
+  if(S_ISLNK(src_st.st_mode)) {
+    ftp_copy_task_t *task;
+
     if(lstat(pathbuf, &st) == 0) {
       if(S_ISLNK(st.st_mode)) {
         if(unlink(pathbuf)) {
@@ -3291,33 +3627,12 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
     if(ftp_mkdirs_parent(pathbuf)) {
       return ftp_perror(env);
     }
-    ftp_copy_task_t *task = calloc(1, sizeof(*task));
+    task = ftp_copy_create_task(env, FTP_COPY_SYMLINK,
+                                env->copy_path, pathbuf, total_bytes);
     if(!task) {
       return ftp_perror(env);
     }
-    task->env = env;
-    task->kind = FTP_COPY_SYMLINK;
-    strncpy(task->src, env->copy_path, sizeof(task->src) - 1);
-    strncpy(task->dst, pathbuf, sizeof(task->dst) - 1);
-
-    pthread_mutex_lock(&env->copy_mutex);
-    env->copy_in_progress = 1;
-    env->copy_thread_valid = 1;
-    pthread_mutex_unlock(&env->copy_mutex);
-
-    int thread_rc = pthread_create(&env->copy_thread, NULL,
-                                   ftp_copy_thread, task);
-    if(thread_rc != 0) {
-      pthread_mutex_lock(&env->copy_mutex);
-      env->copy_in_progress = 0;
-      env->copy_thread_valid = 0;
-      pthread_mutex_unlock(&env->copy_mutex);
-      free(task);
-      errno = thread_rc;
-      return ftp_perror(env);
-    }
-
-    return ftp_active_printf(env, "250 Copy started in background\r\n");
+    return ftp_copy_start_task(env, task);
   }
 
   return ftp_active_printf(env, "550 Unsupported file type\r\n");
@@ -3332,7 +3647,9 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
   char dst_arg[PATH_MAX + 1];
   char src_path[PATH_MAX];
   char dst_path[PATH_MAX];
+  struct stat src_st;
   struct stat st;
+  uintmax_t total_bytes = 0;
 
   ftp_copy_thread_cleanup(env);
   pthread_mutex_lock(&env->copy_mutex);
@@ -3357,11 +3674,16 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
     return ftp_active_printf(env, "553 Source and destination are the same\r\n");
   }
 
-  if(lstat(src_path, &st)) {
+  if(lstat(src_path, &src_st)) {
     return ftp_perror(env);
   }
+  if(S_ISREG(src_st.st_mode) || S_ISLNK(src_st.st_mode)) {
+    total_bytes = (uintmax_t)src_st.st_size;
+  }
 
-  if(S_ISREG(st.st_mode)) {
+  if(S_ISREG(src_st.st_mode)) {
+    ftp_copy_task_t *task;
+
     if(ftp_mkdirs_parent(dst_path)) {
       return ftp_perror(env);
     }
@@ -3373,36 +3695,17 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
       return ftp_perror(env);
     }
 
-    ftp_copy_task_t *task = calloc(1, sizeof(*task));
+    task = ftp_copy_create_task(env, FTP_COPY_REG,
+                                src_path, dst_path, total_bytes);
     if(!task) {
       return ftp_perror(env);
     }
-    task->env = env;
-    task->kind = FTP_COPY_REG;
-    strncpy(task->src, src_path, sizeof(task->src) - 1);
-    strncpy(task->dst, dst_path, sizeof(task->dst) - 1);
-
-    pthread_mutex_lock(&env->copy_mutex);
-    env->copy_in_progress = 1;
-    env->copy_thread_valid = 1;
-    pthread_mutex_unlock(&env->copy_mutex);
-
-    int thread_rc = pthread_create(&env->copy_thread, NULL,
-                                   ftp_copy_thread, task);
-    if(thread_rc != 0) {
-      pthread_mutex_lock(&env->copy_mutex);
-      env->copy_in_progress = 0;
-      env->copy_thread_valid = 0;
-      pthread_mutex_unlock(&env->copy_mutex);
-      free(task);
-      errno = thread_rc;
-      return ftp_perror(env);
-    }
-
-    return ftp_active_printf(env, "250 Copy started in background\r\n");
+    return ftp_copy_start_task(env, task);
   }
 
-  if(S_ISDIR(st.st_mode)) {
+  if(S_ISDIR(src_st.st_mode)) {
+    ftp_copy_task_t *task;
+
     size_t src_len = strlen(src_path);
     if(strncmp(dst_path, src_path, src_len) == 0 &&
        (dst_path[src_len] == '/' || dst_path[src_len] == '\0')) {
@@ -3419,36 +3722,17 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
       return ftp_perror(env);
     }
 
-    ftp_copy_task_t *task = calloc(1, sizeof(*task));
+    task = ftp_copy_create_task(env, FTP_COPY_DIR,
+                                src_path, dst_path, total_bytes);
     if(!task) {
       return ftp_perror(env);
     }
-    task->env = env;
-    task->kind = FTP_COPY_DIR;
-    strncpy(task->src, src_path, sizeof(task->src) - 1);
-    strncpy(task->dst, dst_path, sizeof(task->dst) - 1);
-
-    pthread_mutex_lock(&env->copy_mutex);
-    env->copy_in_progress = 1;
-    env->copy_thread_valid = 1;
-    pthread_mutex_unlock(&env->copy_mutex);
-
-    int thread_rc = pthread_create(&env->copy_thread, NULL,
-                                   ftp_copy_thread, task);
-    if(thread_rc != 0) {
-      pthread_mutex_lock(&env->copy_mutex);
-      env->copy_in_progress = 0;
-      env->copy_thread_valid = 0;
-      pthread_mutex_unlock(&env->copy_mutex);
-      free(task);
-      errno = thread_rc;
-      return ftp_perror(env);
-    }
-
-    return ftp_active_printf(env, "250 Copy started in background\r\n");
+    return ftp_copy_start_task(env, task);
   }
 
-  if(S_ISLNK(st.st_mode)) {
+  if(S_ISLNK(src_st.st_mode)) {
+    ftp_copy_task_t *task;
+
     if(lstat(dst_path, &st) == 0) {
       if(S_ISLNK(st.st_mode)) {
         if(unlink(dst_path)) {
@@ -3464,33 +3748,12 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
     if(ftp_mkdirs_parent(dst_path)) {
       return ftp_perror(env);
     }
-    ftp_copy_task_t *task = calloc(1, sizeof(*task));
+    task = ftp_copy_create_task(env, FTP_COPY_SYMLINK,
+                                src_path, dst_path, total_bytes);
     if(!task) {
       return ftp_perror(env);
     }
-    task->env = env;
-    task->kind = FTP_COPY_SYMLINK;
-    strncpy(task->src, src_path, sizeof(task->src) - 1);
-    strncpy(task->dst, dst_path, sizeof(task->dst) - 1);
-
-    pthread_mutex_lock(&env->copy_mutex);
-    env->copy_in_progress = 1;
-    env->copy_thread_valid = 1;
-    pthread_mutex_unlock(&env->copy_mutex);
-
-    int thread_rc = pthread_create(&env->copy_thread, NULL,
-                                   ftp_copy_thread, task);
-    if(thread_rc != 0) {
-      pthread_mutex_lock(&env->copy_mutex);
-      env->copy_in_progress = 0;
-      env->copy_thread_valid = 0;
-      pthread_mutex_unlock(&env->copy_mutex);
-      free(task);
-      errno = thread_rc;
-      return ftp_perror(env);
-    }
-
-    return ftp_active_printf(env, "250 Copy started in background\r\n");
+    return ftp_copy_start_task(env, task);
   }
 
   return ftp_active_printf(env, "550 Unsupported file type\r\n");
