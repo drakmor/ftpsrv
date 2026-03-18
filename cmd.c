@@ -1861,6 +1861,8 @@ ftp_list_ctx_free(ftp_list_ctx_t *ctx) {
 
 /**
  * Prepare list context, resolve path, and open directory if needed.
+ * Returns 0 on success, 1 if an FTP error reply was sent, or -1 if replying
+ * failed and the control connection should be closed.
  **/
 static int
 ftp_list_open(ftp_env_t *env, const char *arg, int need_pathbuf,
@@ -1876,8 +1878,10 @@ ftp_list_open(ftp_env_t *env, const char *arg, int need_pathbuf,
   }
 
   if(!ctx->argbuf || !ctx->list_path || (need_pathbuf && !ctx->pathbuf)) {
+    int err;
     ftp_list_ctx_free(ctx);
-    return ftp_perror(env);
+    err = ftp_perror(env);
+    return err < 0 ? -1 : 1;
   }
 
   const char *dir_path = allow_opts
@@ -1885,13 +1889,17 @@ ftp_list_open(ftp_env_t *env, const char *arg, int need_pathbuf,
                            : ftp_copy_path_arg(arg, ctx->argbuf, PATH_MAX + 1);
   if(dir_path) {
     if(ftp_abspath(env, ctx->list_path, PATH_MAX + 1, dir_path)) {
+      int err;
       ftp_list_ctx_free(ctx);
-      return ftp_perror(env);
+      err = ftp_perror(env);
+      return err < 0 ? -1 : 1;
     }
   } else {
     if(ftp_normpath(env->cwd, ctx->list_path, PATH_MAX + 1)) {
+      int err;
       ftp_list_ctx_free(ctx);
-      return ftp_perror(env);
+      err = ftp_perror(env);
+      return err < 0 ? -1 : 1;
     }
   }
   ctx->dir_path = ctx->list_path;
@@ -1904,8 +1912,10 @@ ftp_list_open(ftp_env_t *env, const char *arg, int need_pathbuf,
     if(allow_file) {
       return 0;
     }
+    int err;
     ftp_list_ctx_free(ctx);
-    return ftp_perror(env);
+    err = ftp_perror(env);
+    return err < 0 ? -1 : 1;
   }
   if(dir_errno) {
     *dir_errno = 0;
@@ -1928,7 +1938,7 @@ ftp_cmd_LIST(ftp_env_t *env, const char *arg) {
   int dir_errno = 0;
   int err = ftp_list_open(env, arg, 1, 1, 1, &ctx, &dir_errno);
   if(err) {
-    return err;
+    return err < 0 ? err : 0;
   }
 
   if(!ctx.dir) {
@@ -2053,7 +2063,7 @@ ftp_cmd_NLST(ftp_env_t *env, const char *arg) {
   ftp_xfer_buf_t x;
   int err = ftp_list_open(env, arg, 0, 0, 0, &ctx, NULL);
   if(err) {
-    return err;
+    return err < 0 ? err : 0;
   }
 
   int err_xfer = ftp_list_xfer_start(env, ctx.dir, &x);
@@ -2110,7 +2120,7 @@ ftp_cmd_MLSD(ftp_env_t *env, const char *arg) {
   ftp_xfer_buf_t x;
   int err = ftp_list_open(env, arg, 1, 0, 0, &ctx, NULL);
   if(err) {
-    return err;
+    return err < 0 ? err : 0;
   }
 
   int err_xfer = ftp_list_xfer_start(env, ctx.dir, &x);
