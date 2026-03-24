@@ -1603,7 +1603,9 @@ static int ftp_mkdirs_parent(const char *path);
 static int ftp_dir_is_empty(const char *path);
 static int ftp_dirent_is_dots(const char *name);
 static int ftp_dir_next_entry(DIR *dir, struct dirent **ent_out);
+#if (defined(AT_FDCWD) || defined(AT_SYMLINK_NOFOLLOW)) && !defined(__ORBIS__)
 static int ftp_dir_fastpath_should_fallback(int err);
+#endif
 static int ftp_dir_child_lstat(DIR *dir, const char *dir_path,
                                const char *name, struct stat *st);
 static int ftp_dir_child_unlink(DIR *dir, const char *dir_path,
@@ -1794,6 +1796,7 @@ ftp_dir_next_entry(DIR *dir, struct dirent **ent_out) {
   }
 }
 
+#if (defined(AT_FDCWD) || defined(AT_SYMLINK_NOFOLLOW)) && !defined(__ORBIS__)
 static int
 ftp_dir_fastpath_should_fallback(int err) {
   return err == ENOSYS
@@ -1805,6 +1808,7 @@ ftp_dir_fastpath_should_fallback(int err) {
 #endif
          ;
 }
+#endif
 
 typedef enum {
   FTP_DIRENT_UNKNOWN,
@@ -1847,7 +1851,7 @@ ftp_dir_open_child(DIR *dir, const char *child_path,
     return -1;
   }
 
-#if defined(AT_FDCWD)
+#if defined(AT_FDCWD) && !defined(__ORBIS__)
   {
     int dir_fd = dirfd(dir);
 
@@ -1891,7 +1895,7 @@ ftp_dir_open_child(DIR *dir, const char *child_path,
 static int
 ftp_dir_child_lstat(DIR *dir, const char *dir_path,
                     const char *name, struct stat *st) {
-#if defined(AT_SYMLINK_NOFOLLOW)
+#if defined(AT_SYMLINK_NOFOLLOW) && !defined(__ORBIS__)
   int dir_fd = dirfd(dir);
 
   if(dir_fd >= 0) {
@@ -2007,7 +2011,7 @@ ftp_dir_size_walk(DIR *dir, const char *path, uintmax_t *size_out) {
 
 static int
 ftp_dir_child_unlink(DIR *dir, const char *dir_path, const char *name) {
-#if defined(AT_FDCWD)
+#if defined(AT_FDCWD) && !defined(__ORBIS__)
   int dir_fd = dirfd(dir);
 
   if(dir_fd >= 0) {
