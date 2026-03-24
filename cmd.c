@@ -1461,6 +1461,13 @@ ftp_join_path(char *dst, size_t dst_sz, const char *dir_path, const char *name) 
 /**
  * Recursively compute the size of a directory.
  **/
+static int ftp_dir_next_entry(DIR *dir, struct dirent **ent_out);
+static int ftp_dir_open_child(DIR *dir, const char *child_path,
+                              const char *name, DIR **child_out);
+static int ftp_dir_size_walk(DIR *dir, const char *path, uintmax_t *size_out);
+static int ftp_dir_child_lstat(DIR *dir, const char *dir_path,
+                               const char *name, struct stat *st);
+
 static int
 ftp_dir_size(const char *path, uintmax_t *size_out) {
   DIR *dir = opendir(path);
@@ -1468,70 +1475,14 @@ ftp_dir_size(const char *path, uintmax_t *size_out) {
     return -1;
   }
 
-  struct dirent *ent;
-  for(;;) {
-    errno = 0;
-    ent = readdir(dir);
-    if(!ent) {
-      if(errno) {
-        int err = errno;
-        closedir(dir);
-        errno = err;
-        return -1;
-      }
-      break;
-    }
-
-    if(ent->d_name[0] == '.' &&
-       (ent->d_name[1] == '\0' ||
-        (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
-      continue;
-    }
-
-    char child[PATH_MAX];
-    if(ftp_join_path(child, sizeof(child), path, ent->d_name) != 0) {
-      int err = errno;
-      closedir(dir);
-      errno = err;
-      return -1;
-    }
-
-    struct stat st;
-    if(lstat(child, &st)) {
-      int err = errno;
-      closedir(dir);
-      errno = err;
-      return -1;
-    }
-
-    if(S_ISDIR(st.st_mode)) {
-      if(ftp_dir_size(child, size_out)) {
-        int err = errno;
-        closedir(dir);
-        errno = err;
-        return -1;
-      }
-      continue;
-    }
-
-    if(S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
-      if(UINTMAX_MAX - *size_out < (uintmax_t)st.st_size) {
-        int err = EOVERFLOW;
-        closedir(dir);
-        errno = err;
-        return -1;
-      }
-      *size_out += (uintmax_t)st.st_size;
-      continue;
-    }
-
-    int err = EINVAL;
+  if(ftp_dir_size_walk(dir, path, size_out) != 0) {
+    int saved_errno = errno;
     closedir(dir);
-    errno = err;
+    errno = saved_errno;
     return -1;
   }
 
-  if(closedir(dir)) {
+  if(closedir(dir) != 0) {
     return -1;
   }
   return 0;
@@ -1542,6 +1493,11 @@ ftp_dir_size(const char *path, uintmax_t *size_out) {
  **/
 #define FTP_NOTIFY_PATH_SIZE 224
 #define FTP_DELETE_NOTIFY_CHECK_ITEMS 64
+
+typedef enum {
+  FTP_BG_COPY,
+  FTP_BG_MOVE,
+} ftp_bg_op_t;
 
 static void
 ftp_compact_path(const char *path, char *out, size_t out_size) {
@@ -1641,6 +1597,37 @@ typedef struct {
 static void ftp_copy_thread_cleanup(ftp_env_t *env);
 static void ftp_delete_thread_cleanup(ftp_env_t *env);
 static void *ftp_delete_thread(void *arg);
+static int ftp_split_copy_args(const char *arg, char *src, size_t src_sz,
+                               char *dst, size_t dst_sz);
+static int ftp_mkdirs_parent(const char *path);
+static int ftp_dir_is_empty(const char *path);
+static int ftp_dirent_is_dots(const char *name);
+static int ftp_dir_next_entry(DIR *dir, struct dirent **ent_out);
+static int ftp_dir_fastpath_should_fallback(int err);
+static int ftp_dir_child_lstat(DIR *dir, const char *dir_path,
+                               const char *name, struct stat *st);
+static int ftp_dir_child_unlink(DIR *dir, const char *dir_path,
+                                const char *name);
+static void ftp_store_first_error(int *err_out, int err);
+static int ftp_copy_probe_destination(const char *dst_path, int target_is_dir,
+                                      int create_parent_dirs);
+static int ftp_target_statvfs(const char *dst_path, int target_is_dir,
+                              struct statvfs *vfs_out);
+static int ftp_copy_check_space(const char *dst_path, int target_is_dir,
+                                uintmax_t total_bytes);
+static int ftp_copy_total_for_stat(const char *path, const struct stat *st,
+                                   uintmax_t *total_out);
+static int ftp_copy_prepare_total(const char *src_path,
+                                  const struct stat *src_st,
+                                  const char *dst_path, int target_is_dir,
+                                  uintmax_t *total_bytes_out);
+static int ftp_move_same_device(const char *src_path, const struct stat *src_st,
+                                const char *dst_path, int *same_device);
+static int ftp_move_start_background(ftp_env_t *env, ftp_bg_op_t op,
+                                     const char *src_path,
+                                     const char *dst_path,
+                                     const struct stat *src_st,
+                                     int create_parent_dirs);
 
 static void
 ftp_delete_format_rate(double items_per_sec, char *out, size_t out_size) {
@@ -1784,6 +1771,273 @@ ftp_delete_notify_result(const ftp_delete_task_t *task, int rc, int err) {
 }
 
 static int
+ftp_dirent_is_dots(const char *name) {
+  if(!name || name[0] != '.') {
+    return 0;
+  }
+
+  return name[1] == '\0' ||
+         (name[1] == '.' && name[2] == '\0');
+}
+
+static int
+ftp_dir_next_entry(DIR *dir, struct dirent **ent_out) {
+  for(;;) {
+    errno = 0;
+    *ent_out = readdir(dir);
+    if(!*ent_out) {
+      return errno ? -1 : 0;
+    }
+    if(!ftp_dirent_is_dots((*ent_out)->d_name)) {
+      return 1;
+    }
+  }
+}
+
+static int
+ftp_dir_fastpath_should_fallback(int err) {
+  return err == ENOSYS
+#ifdef EINVAL
+         || err == EINVAL
+#endif
+#ifdef EOPNOTSUPP
+         || err == EOPNOTSUPP
+#endif
+         ;
+}
+
+typedef enum {
+  FTP_DIRENT_UNKNOWN,
+  FTP_DIRENT_REG,
+  FTP_DIRENT_DIR,
+  FTP_DIRENT_LNK,
+  FTP_DIRENT_OTHER,
+} ftp_dirent_kind_t;
+
+static ftp_dirent_kind_t
+ftp_dirent_kind(const struct dirent *ent) {
+  if(!ent) {
+    return FTP_DIRENT_UNKNOWN;
+  }
+
+#if defined(DT_DIR) && defined(DT_REG) && defined(DT_LNK) && defined(DT_UNKNOWN)
+  switch(ent->d_type) {
+    case DT_DIR:
+      return FTP_DIRENT_DIR;
+    case DT_REG:
+      return FTP_DIRENT_REG;
+    case DT_LNK:
+      return FTP_DIRENT_LNK;
+    case DT_UNKNOWN:
+      return FTP_DIRENT_UNKNOWN;
+    default:
+      return FTP_DIRENT_OTHER;
+  }
+#else
+  (void)ent;
+  return FTP_DIRENT_UNKNOWN;
+#endif
+}
+
+static int
+ftp_dir_open_child(DIR *dir, const char *child_path,
+                   const char *name, DIR **child_out) {
+  if(!child_path || !name || !child_out) {
+    errno = EINVAL;
+    return -1;
+  }
+
+#if defined(AT_FDCWD)
+  {
+    int dir_fd = dirfd(dir);
+
+    if(dir_fd >= 0) {
+      int flags = O_RDONLY;
+      int fd;
+
+#ifdef O_CLOEXEC
+      flags |= O_CLOEXEC;
+#endif
+#ifdef O_DIRECTORY
+      flags |= O_DIRECTORY;
+#endif
+
+      fd = openat(dir_fd, name, flags, 0);
+      if(fd >= 0) {
+        *child_out = fdopendir(fd);
+        if(*child_out) {
+          return 0;
+        }
+        {
+          int saved_errno = errno;
+          close(fd);
+          errno = saved_errno;
+          return -1;
+        }
+      }
+      if(!ftp_dir_fastpath_should_fallback(errno)) {
+        return -1;
+      }
+    }
+  }
+#else
+  (void)dir;
+#endif
+
+  *child_out = opendir(child_path);
+  return *child_out ? 0 : -1;
+}
+
+static int
+ftp_dir_child_lstat(DIR *dir, const char *dir_path,
+                    const char *name, struct stat *st) {
+#if defined(AT_SYMLINK_NOFOLLOW)
+  int dir_fd = dirfd(dir);
+
+  if(dir_fd >= 0) {
+    if(fstatat(dir_fd, name, st, AT_SYMLINK_NOFOLLOW) == 0) {
+      return 0;
+    }
+    if(!ftp_dir_fastpath_should_fallback(errno)) {
+      return -1;
+    }
+  }
+#else
+  (void)dir;
+#endif
+
+  char child[PATH_MAX];
+  if(ftp_join_path(child, sizeof(child), dir_path, name) != 0) {
+    return -1;
+  }
+
+  return lstat(child, st);
+}
+
+static int
+ftp_dir_size_walk(DIR *dir, const char *path, uintmax_t *size_out) {
+  struct dirent *ent;
+
+  if(!dir || !path || !size_out) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  for(;;) {
+    int rc = ftp_dir_next_entry(dir, &ent);
+    if(rc <= 0) {
+      if(rc < 0) {
+        return -1;
+      }
+      break;
+    }
+
+    ftp_dirent_kind_t kind = ftp_dirent_kind(ent);
+    if(kind == FTP_DIRENT_DIR) {
+      char child[PATH_MAX];
+      DIR *child_dir;
+      int saved_errno;
+
+      if(ftp_join_path(child, sizeof(child), path, ent->d_name) != 0) {
+        return -1;
+      }
+      if(ftp_dir_open_child(dir, child, ent->d_name, &child_dir) != 0) {
+        return -1;
+      }
+      if(ftp_dir_size_walk(child_dir, child, size_out) != 0) {
+        saved_errno = errno;
+        closedir(child_dir);
+        errno = saved_errno;
+        return -1;
+      }
+      if(closedir(child_dir) != 0) {
+        return -1;
+      }
+      continue;
+    }
+
+    if(kind == FTP_DIRENT_OTHER) {
+      errno = EINVAL;
+      return -1;
+    }
+
+    struct stat st;
+    if(ftp_dir_child_lstat(dir, path, ent->d_name, &st) != 0) {
+      return -1;
+    }
+
+    if(S_ISDIR(st.st_mode)) {
+      char child[PATH_MAX];
+      DIR *child_dir;
+      int saved_errno;
+
+      if(ftp_join_path(child, sizeof(child), path, ent->d_name) != 0) {
+        return -1;
+      }
+      if(ftp_dir_open_child(dir, child, ent->d_name, &child_dir) != 0) {
+        return -1;
+      }
+      if(ftp_dir_size_walk(child_dir, child, size_out) != 0) {
+        saved_errno = errno;
+        closedir(child_dir);
+        errno = saved_errno;
+        return -1;
+      }
+      if(closedir(child_dir) != 0) {
+        return -1;
+      }
+      continue;
+    }
+
+    if(S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+      if(UINTMAX_MAX - *size_out < (uintmax_t)st.st_size) {
+        errno = EOVERFLOW;
+        return -1;
+      }
+      *size_out += (uintmax_t)st.st_size;
+      continue;
+    }
+
+    errno = EINVAL;
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+ftp_dir_child_unlink(DIR *dir, const char *dir_path, const char *name) {
+#if defined(AT_FDCWD)
+  int dir_fd = dirfd(dir);
+
+  if(dir_fd >= 0) {
+    if(unlinkat(dir_fd, name, 0) == 0) {
+      return 0;
+    }
+    if(!ftp_dir_fastpath_should_fallback(errno)) {
+      return -1;
+    }
+  }
+#else
+  (void)dir;
+#endif
+
+  char child[PATH_MAX];
+  if(ftp_join_path(child, sizeof(child), dir_path, name) != 0) {
+    return -1;
+  }
+
+  return unlink(child);
+}
+
+static void
+ftp_store_first_error(int *err_out, int err) {
+  if(err_out && !*err_out) {
+    *err_out = err;
+  }
+}
+
+static int
 ftp_delete_count_dir(const char *path, uintmax_t *count_out) {
   DIR *dir = opendir(path);
   struct dirent *ent;
@@ -1793,34 +2047,19 @@ ftp_delete_count_dir(const char *path, uintmax_t *count_out) {
   }
 
   for(;;) {
-    errno = 0;
-    ent = readdir(dir);
-    if(!ent) {
-      if(errno) {
-        int err = errno;
+    int rc = ftp_dir_next_entry(dir, &ent);
+    if(rc <= 0) {
+      if(rc < 0) {
+        int saved_errno = errno;
         closedir(dir);
-        errno = err;
+        errno = saved_errno;
         return -1;
       }
       break;
     }
 
-    if(ent->d_name[0] == '.' &&
-       (ent->d_name[1] == '\0' ||
-        (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
-      continue;
-    }
-
-    char child[PATH_MAX];
     struct stat st;
-
-    if(ftp_join_path(child, sizeof(child), path, ent->d_name) != 0) {
-      int err = errno;
-      closedir(dir);
-      errno = err;
-      return -1;
-    }
-    if(lstat(child, &st) != 0) {
+    if(ftp_dir_child_lstat(dir, path, ent->d_name, &st) != 0) {
       int err = errno;
       closedir(dir);
       errno = err;
@@ -1828,6 +2067,14 @@ ftp_delete_count_dir(const char *path, uintmax_t *count_out) {
     }
 
     if(S_ISDIR(st.st_mode)) {
+      char child[PATH_MAX];
+
+      if(ftp_join_path(child, sizeof(child), path, ent->d_name) != 0) {
+        int err = errno;
+        closedir(dir);
+        errno = err;
+        return -1;
+      }
       if(ftp_delete_count_dir(child, count_out) != 0) {
         int err = errno;
         closedir(dir);
@@ -1856,62 +2103,45 @@ static int
 ftp_rmda_delete_dir(const char *path, int *err_out, ftp_delete_task_t *task) {
   DIR *dir = opendir(path);
   if(!dir) {
-    if(!*err_out) {
-      *err_out = errno;
-    }
+    ftp_store_first_error(err_out, errno);
     return -1;
   }
 
   int failed = 0;
   struct dirent *ent;
   for(;;) {
-    errno = 0;
-    ent = readdir(dir);
-    if(!ent) {
-      if(errno && !*err_out) {
-        *err_out = errno;
-      }
-      if(errno) {
+    int rc = ftp_dir_next_entry(dir, &ent);
+    if(rc <= 0) {
+      if(rc < 0) {
+        ftp_store_first_error(err_out, errno);
         failed = 1;
       }
       break;
     }
 
-    if(ent->d_name[0] == '.' &&
-       (ent->d_name[1] == '\0' ||
-        (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
-      continue;
-    }
-
-    char child[PATH_MAX];
-    if(ftp_join_path(child, sizeof(child), path, ent->d_name) != 0) {
-      if(!*err_out) {
-        *err_out = errno;
-      }
-      failed = 1;
-      continue;
-    }
-
     struct stat st;
-    if(lstat(child, &st)) {
-      if(!*err_out) {
-        *err_out = errno;
-      }
+    if(ftp_dir_child_lstat(dir, path, ent->d_name, &st) != 0) {
+      ftp_store_first_error(err_out, errno);
       failed = 1;
       continue;
     }
 
     if(S_ISDIR(st.st_mode)) {
+      char child[PATH_MAX];
+
+      if(ftp_join_path(child, sizeof(child), path, ent->d_name) != 0) {
+        ftp_store_first_error(err_out, errno);
+        failed = 1;
+        continue;
+      }
       if(ftp_rmda_delete_dir(child, err_out, task)) {
         failed = 1;
       }
       continue;
     }
 
-    if(unlink(child)) {
-      if(!*err_out) {
-        *err_out = errno;
-      }
+    if(ftp_dir_child_unlink(dir, path, ent->d_name) != 0) {
+      ftp_store_first_error(err_out, errno);
       failed = 1;
     } else {
       ftp_delete_progress_add(task, 1);
@@ -1919,9 +2149,7 @@ ftp_rmda_delete_dir(const char *path, int *err_out, ftp_delete_task_t *task) {
   }
 
   if(closedir(dir)) {
-    if(!*err_out) {
-      *err_out = errno;
-    }
+    ftp_store_first_error(err_out, errno);
     failed = 1;
   }
 
@@ -1930,14 +2158,11 @@ ftp_rmda_delete_dir(const char *path, int *err_out, ftp_delete_task_t *task) {
   }
 
   if(rmdir(path)) {
-    if(!*err_out) {
-      *err_out = errno;
-    }
+    ftp_store_first_error(err_out, errno);
     return -1;
   }
 
   ftp_delete_progress_add(task, 1);
-
   return 0;
 }
 
@@ -3085,6 +3310,7 @@ int
 ftp_cmd_RNTO(ftp_env_t *env, const char* arg) {
   char pathbuf[PATH_MAX];
   struct stat st;
+  int same_device = 0;
 
   if(!arg[0]) {
     return ftp_active_printf(env, "501 Usage: RNTO <PATH>\r\n");
@@ -3093,6 +3319,14 @@ ftp_cmd_RNTO(ftp_env_t *env, const char* arg) {
   if(!env->rename_ready) {
     return ftp_active_printf(env, "503 Bad sequence of commands\r\n");
   }
+
+  ftp_copy_thread_cleanup(env);
+  ftp_delete_thread_cleanup(env);
+  if(ftp_bg_op_busy(env)) {
+    return ftp_active_printf(env,
+                             "450 Background file operation in progress\r\n");
+  }
+
   env->rename_ready = 0;
   if(lstat(env->rename_path, &st)) {
     return ftp_perror(env);
@@ -3101,11 +3335,21 @@ ftp_cmd_RNTO(ftp_env_t *env, const char* arg) {
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), arg)) {
     return ftp_perror(env);
   }
-  if(rename(env->rename_path, pathbuf)) {
+
+  if(ftp_move_same_device(env->rename_path, &st, pathbuf, &same_device)) {
     return ftp_perror(env);
   }
+  if(same_device) {
+    if(rename(env->rename_path, pathbuf) == 0) {
+      return ftp_active_printf(env, "250 Path renamed\r\n");
+    }
+    if(errno != EXDEV) {
+      return ftp_perror(env);
+    }
+  }
 
-  return ftp_active_printf(env, "250 Path renamed\r\n");
+  return ftp_move_start_background(env, FTP_BG_MOVE,
+                                   env->rename_path, pathbuf, &st, 0);
 }
 
 /**
@@ -3145,6 +3389,68 @@ ftp_cmd_CPFR(ftp_env_t *env, const char* arg) {
 
   env->copy_ready = 1;
   return ftp_active_printf(env, "350 Awaiting CPTO\r\n");
+}
+
+int
+ftp_cmd_MOVE(ftp_env_t *env, const char* arg) {
+  char src_arg[PATH_MAX + 1];
+  char dst_arg[PATH_MAX + 1];
+  char src_path[PATH_MAX];
+  char dst_path[PATH_MAX];
+  struct stat src_st;
+  int same_device = 0;
+
+  if(ftp_split_copy_args(arg, src_arg, sizeof(src_arg),
+                         dst_arg, sizeof(dst_arg))) {
+    return ftp_active_printf(env, "501 Usage: MOVE <FROM> <TO>\r\n");
+  }
+
+  ftp_copy_thread_cleanup(env);
+  ftp_delete_thread_cleanup(env);
+  if(ftp_bg_op_busy(env)) {
+    return ftp_active_printf(env,
+                             "450 Background file operation in progress\r\n");
+  }
+
+  if(ftp_abspath(env, src_path, sizeof(src_path), src_arg)) {
+    return ftp_perror(env);
+  }
+  if(ftp_abspath(env, dst_path, sizeof(dst_path), dst_arg)) {
+    return ftp_perror(env);
+  }
+  if(strcmp(src_path, dst_path) == 0) {
+    return ftp_active_printf(env, "553 Source and destination are the same\r\n");
+  }
+  if(lstat(src_path, &src_st)) {
+    return ftp_perror(env);
+  }
+
+  if(S_ISDIR(src_st.st_mode)) {
+    size_t src_len = strlen(src_path);
+    if(strncmp(dst_path, src_path, src_len) == 0 &&
+       (dst_path[src_len] == '/' || dst_path[src_len] == '\0')) {
+      return ftp_active_printf(env, "553 Cannot move into itself\r\n");
+    }
+  }
+
+  if(ftp_move_same_device(src_path, &src_st, dst_path, &same_device)) {
+    return ftp_perror(env);
+  }
+
+  if(same_device) {
+    if(ftp_mkdirs_parent(dst_path)) {
+      return ftp_perror(env);
+    }
+    if(rename(src_path, dst_path) == 0) {
+      return ftp_active_printf(env, "250 Path moved\r\n");
+    }
+    if(errno != EXDEV) {
+      return ftp_perror(env);
+    }
+  }
+
+  return ftp_move_start_background(env, FTP_BG_MOVE,
+                                   src_path, dst_path, &src_st, 1);
 }
 
 /**
@@ -3194,18 +3500,428 @@ ftp_split_copy_args(const char *arg, char *src, size_t src_sz,
   return 0;
 }
 
+static int
+ftp_path_parent_dir(const char *path, char *parent, size_t parent_size) {
+  char *slash;
+  size_t len;
+
+  if(!path || !parent || parent_size == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  len = strlen(path);
+  if(len >= parent_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  memcpy(parent, path, len + 1);
+
+  slash = strrchr(parent, '/');
+  if(!slash) {
+    errno = EINVAL;
+    return -1;
+  }
+  if(slash == parent) {
+    parent[1] = '\0';
+  } else {
+    *slash = '\0';
+  }
+
+  return 0;
+}
+
+static int
+ftp_path_parent_must_exist(const char *path) {
+  char parent[PATH_MAX];
+  struct stat st;
+
+  if(ftp_path_parent_dir(path, parent, sizeof(parent)) != 0) {
+    return -1;
+  }
+  if(stat(parent, &st) != 0) {
+    return -1;
+  }
+  if(!S_ISDIR(st.st_mode)) {
+    errno = ENOTDIR;
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+ftp_make_temp_path(const char *path, char *tmp_path, size_t tmp_path_size) {
+  char parent[PATH_MAX];
+  int n;
+
+  if(ftp_path_parent_dir(path, parent, sizeof(parent)) != 0) {
+    return -1;
+  }
+
+  n = snprintf(tmp_path, tmp_path_size, "%s/.ftpsrv-tmp-XXXXXX", parent);
+  if(n < 0 || (size_t)n >= tmp_path_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+ftp_dir_make_temp_path(const char *dir_path, const char *suffix,
+                       char *tmp_path, size_t tmp_path_size) {
+  int n;
+
+  if(!dir_path || !suffix || !tmp_path || tmp_path_size == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  n = snprintf(tmp_path, tmp_path_size, "%s/%s", dir_path, suffix);
+  if(n < 0 || (size_t)n >= tmp_path_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+ftp_probe_write_in_dir(const char *dir_path) {
+  char probe_path[PATH_MAX];
+  int fd = -1;
+  int saved_errno = 0;
+  static const char probe_byte = '\0';
+
+  if(ftp_dir_make_temp_path(dir_path, ".ftpsrv-probe-XXXXXX",
+                            probe_path, sizeof(probe_path)) != 0) {
+    return -1;
+  }
+
+  fd = mkstemp(probe_path);
+  if(fd < 0) {
+    return -1;
+  }
+
+  if(io_nwrite(fd, &probe_byte, sizeof(probe_byte)) != 0) {
+    saved_errno = errno;
+    close(fd);
+    unlink(probe_path);
+    errno = saved_errno;
+    return -1;
+  }
+
+  if(close(fd) != 0) {
+    saved_errno = errno;
+    unlink(probe_path);
+    errno = saved_errno;
+    return -1;
+  }
+
+  if(unlink(probe_path) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+ftp_probe_create_dir_and_write(const char *dst_path) {
+  char parent[PATH_MAX];
+  char probe_dir[PATH_MAX];
+  int saved_errno = 0;
+
+  if(ftp_path_parent_dir(dst_path, parent, sizeof(parent)) != 0) {
+    return -1;
+  }
+  if(ftp_dir_make_temp_path(parent, ".ftpsrv-probe-dir-XXXXXX",
+                            probe_dir, sizeof(probe_dir)) != 0) {
+    return -1;
+  }
+
+  if(!mkdtemp(probe_dir)) {
+    return -1;
+  }
+
+  if(ftp_probe_write_in_dir(probe_dir) != 0) {
+    saved_errno = errno;
+    rmdir(probe_dir);
+    errno = saved_errno;
+    return -1;
+  }
+
+  if(rmdir(probe_dir) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+ftp_copy_probe_destination(const char *dst_path, int target_is_dir,
+                           int create_parent_dirs) {
+  char parent[PATH_MAX];
+  struct stat st;
+
+  if(!dst_path) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if(create_parent_dirs) {
+    if(ftp_mkdirs_parent(dst_path) != 0) {
+      return -1;
+    }
+  } else if(ftp_path_parent_must_exist(dst_path) != 0) {
+    return -1;
+  }
+
+  if(target_is_dir) {
+    if(lstat(dst_path, &st) == 0) {
+      if(!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+      }
+      return ftp_probe_write_in_dir(dst_path);
+    }
+    if(errno != ENOENT) {
+      return -1;
+    }
+    return ftp_probe_create_dir_and_write(dst_path);
+  }
+
+  if(ftp_path_parent_dir(dst_path, parent, sizeof(parent)) != 0) {
+    return -1;
+  }
+
+  return ftp_probe_write_in_dir(parent);
+}
+
+static int
+ftp_path_parent_stat(const char *path, struct stat *st) {
+  char parent[PATH_MAX];
+
+  if(!path || !st) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if(ftp_path_parent_dir(path, parent, sizeof(parent)) != 0) {
+    return -1;
+  }
+
+  while(1) {
+    char *slash;
+
+    if(stat(parent, st) == 0) {
+      return 0;
+    }
+    if(errno != ENOENT) {
+      return -1;
+    }
+    if(strcmp(parent, "/") == 0) {
+      return -1;
+    }
+
+    slash = strrchr(parent, '/');
+    if(!slash) {
+      errno = ENOENT;
+      return -1;
+    }
+    if(slash == parent) {
+      parent[1] = '\0';
+    } else {
+      *slash = '\0';
+    }
+  }
+}
+
+static int
+ftp_target_statvfs(const char *dst_path, int target_is_dir,
+                   struct statvfs *vfs_out) {
+  char path[PATH_MAX];
+
+  if(!dst_path || !vfs_out) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if(target_is_dir) {
+    size_t len = strlen(dst_path);
+
+    if(len >= sizeof(path)) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+    memcpy(path, dst_path, len + 1);
+  } else if(ftp_path_parent_dir(dst_path, path, sizeof(path)) != 0) {
+    return -1;
+  }
+
+  while(1) {
+    if(statvfs(path, vfs_out) == 0) {
+      return 0;
+    }
+    if(errno != ENOENT) {
+      return -1;
+    }
+    if(strcmp(path, "/") == 0) {
+      return -1;
+    }
+
+    if(ftp_path_parent_dir(path, path, sizeof(path)) != 0) {
+      return -1;
+    }
+  }
+}
+
+static int
+ftp_copy_check_space(const char *dst_path, int target_is_dir,
+                     uintmax_t total_bytes) {
+  struct statvfs vfs;
+  uintmax_t unit;
+  uintmax_t avail;
+  uintmax_t slack = 0;
+  uintmax_t required;
+
+  if(ftp_target_statvfs(dst_path, target_is_dir, &vfs) != 0) {
+    return -1;
+  }
+
+  unit = vfs.f_frsize ? (uintmax_t)vfs.f_frsize : (uintmax_t)vfs.f_bsize;
+  avail = (uintmax_t)vfs.f_bavail * unit;
+  if(total_bytes != 0) {
+    slack = (total_bytes + 99) / 100;
+  }
+  required = ftp_saturating_add(total_bytes, slack);
+  if(avail < required) {
+    errno = ENOSPC;
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+ftp_copy_prepare_total(const char *src_path, const struct stat *src_st,
+                       const char *dst_path, int target_is_dir,
+                       uintmax_t *total_bytes_out) {
+  uintmax_t total_bytes = 0;
+
+  if(!src_path || !src_st || !dst_path || !total_bytes_out) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if(ftp_copy_total_for_stat(src_path, src_st, &total_bytes) != 0) {
+    return -1;
+  }
+  if(ftp_copy_check_space(dst_path, target_is_dir, total_bytes) != 0) {
+    return -1;
+  }
+
+  *total_bytes_out = total_bytes;
+  return 0;
+}
+
+static int
+ftp_dir_is_empty(const char *path) {
+  DIR *dir;
+  int empty = 1;
+  int saved_errno = 0;
+
+  dir = opendir(path);
+  if(!dir) {
+    return -1;
+  }
+
+  struct dirent *ent;
+  int rc = ftp_dir_next_entry(dir, &ent);
+  if(rc < 0) {
+    saved_errno = errno;
+    empty = -1;
+  } else if(rc > 0) {
+    empty = 0;
+  }
+
+  if(closedir(dir) != 0 && saved_errno == 0 && empty >= 0) {
+    saved_errno = errno;
+    empty = -1;
+  }
+  if(saved_errno) {
+    errno = saved_errno;
+  }
+
+  return empty;
+}
+
+static int
+ftp_move_same_device(const char *src_path, const struct stat *src_st,
+                     const char *dst_path, int *same_device) {
+  struct stat st;
+
+  if(!src_path || !src_st || !dst_path || !same_device) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if(lstat(dst_path, &st) == 0) {
+    *same_device = st.st_dev == src_st->st_dev;
+    return 0;
+  }
+  if(errno != ENOENT) {
+    return -1;
+  }
+
+  if(ftp_path_parent_stat(dst_path, &st) != 0) {
+    return -1;
+  }
+
+  *same_device = st.st_dev == src_st->st_dev;
+  return 0;
+}
+
 /**
  * Copy a symlink from src to dst.
  **/
 static int
 ftp_copy_symlink(const char *src_path, const char *dst_path) {
   char linkbuf[PATH_MAX + 1];
+  char tmp_path[PATH_MAX];
   ssize_t len = readlink(src_path, linkbuf, sizeof(linkbuf) - 1);
+  int fd;
+
   if(len < 0) {
     return -1;
   }
   linkbuf[len] = '\0';
-  return symlink(linkbuf, dst_path);
+
+  if(ftp_make_temp_path(dst_path, tmp_path, sizeof(tmp_path)) != 0) {
+    return -1;
+  }
+
+  fd = mkstemp(tmp_path);
+  if(fd < 0) {
+    return -1;
+  }
+  close(fd);
+  if(unlink(tmp_path) != 0) {
+    return -1;
+  }
+
+  if(symlink(linkbuf, tmp_path) != 0) {
+    return -1;
+  }
+
+  if(rename(tmp_path, dst_path) != 0) {
+    int saved_errno = errno;
+    unlink(tmp_path);
+    errno = saved_errno;
+    return -1;
+  }
+
+  return 0;
 }
 
 typedef enum {
@@ -3227,6 +3943,7 @@ typedef struct {
 
 typedef struct {
   ftp_env_t *env;
+  ftp_bg_op_t op;
   ftp_copy_kind_t kind;
   char src[PATH_MAX];
   char dst[PATH_MAX];
@@ -3236,7 +3953,7 @@ typedef struct {
 } ftp_copy_task_t;
 
 static ftp_copy_task_t*
-ftp_copy_create_task(ftp_env_t *env, ftp_copy_kind_t kind,
+ftp_copy_create_task(ftp_env_t *env, ftp_bg_op_t op, ftp_copy_kind_t kind,
                      const char *src, const char *dst,
                      uintmax_t total_bytes) {
   ftp_copy_task_t *task;
@@ -3252,6 +3969,7 @@ ftp_copy_create_task(ftp_env_t *env, ftp_copy_kind_t kind,
   }
 
   task->env = env;
+  task->op = op;
   task->kind = kind;
   task->progress.total_bytes = total_bytes;
   snprintf(task->src, sizeof(task->src), "%s", src);
@@ -3260,6 +3978,11 @@ ftp_copy_create_task(ftp_env_t *env, ftp_copy_kind_t kind,
   ftp_compact_path(dst, task->dst_notify, sizeof(task->dst_notify));
 
   return task;
+}
+
+static const char *
+ftp_bg_op_name(ftp_bg_op_t op) {
+  return op == FTP_BG_MOVE ? "Move" : "Copy";
 }
 
 static void
@@ -3364,7 +4087,8 @@ ftp_copy_notify_start(ftp_copy_task_t *task) {
   task->progress.next_check_bytes =
     ftp_saturating_add(task->progress.copied_bytes,
                        FTP_COPY_NOTIFY_CHECK_BYTES);
-  notify("Copy started: %s -> %s", task->src_notify, task->dst_notify);
+  notify("%s started: %s -> %s",
+         ftp_bg_op_name(task->op), task->src_notify, task->dst_notify);
 }
 
 static void
@@ -3419,7 +4143,8 @@ ftp_copy_notify_progress(ftp_copy_task_t *task) {
   task->progress.next_check_bytes =
     ftp_saturating_add(task->progress.copied_bytes,
                        FTP_COPY_NOTIFY_CHECK_BYTES);
-  notify("Copy %u%% (%s / %s) - %s",
+  notify("%s %u%% (%s / %s) - %s",
+         ftp_bg_op_name(task->op),
          ftp_copy_progress_percent(task), copied_str, total_str, speed);
 }
 
@@ -3447,13 +4172,14 @@ ftp_copy_notify_result(const ftp_copy_task_t *task, int rc, int err) {
     if(err == 0) {
       err = EIO;
     }
-    notify("Copy failed %u%%: %s -> %s (%s)",
-           pct, task->src_notify, task->dst_notify, strerror(err));
+    notify("%s failed %u%%: %s -> %s (%s)",
+           ftp_bg_op_name(task->op), pct,
+           task->src_notify, task->dst_notify, strerror(err));
     return;
   }
 
-  notify("Copy finished %u%%: %s -> %s (OK)",
-         pct, task->src_notify, task->dst_notify);
+  notify("%s finished %u%%: %s -> %s (OK)",
+         ftp_bg_op_name(task->op), pct, task->src_notify, task->dst_notify);
 }
 
 static int
@@ -3476,7 +4202,154 @@ ftp_copy_start_task(ftp_env_t *env, ftp_copy_task_t *task) {
     return ftp_perror(env);
   }
 
-  return ftp_active_printf(env, "250 Copy started in background\r\n");
+  return ftp_active_printf(env, "250 %s started in background\r\n",
+                           ftp_bg_op_name(task->op));
+}
+
+static int
+ftp_move_remove_source(ftp_copy_task_t *task) {
+  if(!task || task->op != FTP_BG_MOVE) {
+    return 0;
+  }
+
+  switch(task->kind) {
+    case FTP_COPY_REG:
+      if(unlink(task->src) != 0) {
+        return -1;
+      }
+      return 0;
+    case FTP_COPY_SYMLINK:
+      if(unlink(task->src) != 0) {
+        return -1;
+      }
+      return 0;
+    case FTP_COPY_DIR:
+      {
+        int err = 0;
+
+        if(ftp_rmda_delete_dir(task->src, &err, NULL) != 0) {
+          if(err) {
+            errno = err;
+          }
+          return -1;
+        }
+      }
+      return 0;
+  }
+
+  errno = EINVAL;
+  return -1;
+}
+
+static int
+ftp_move_start_background(ftp_env_t *env, ftp_bg_op_t op,
+                          const char *src_path, const char *dst_path,
+                          const struct stat *src_st,
+                          int create_parent_dirs) {
+  ftp_copy_task_t *task;
+  struct stat st;
+  uintmax_t total_bytes;
+
+  if(!env || !src_path || !dst_path || !src_st) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  ftp_copy_thread_cleanup(env);
+  ftp_delete_thread_cleanup(env);
+  if(ftp_bg_op_busy(env)) {
+    return ftp_active_printf(env,
+                             "450 Background file operation in progress\r\n");
+  }
+
+  if(S_ISREG(src_st->st_mode)) {
+    if(lstat(dst_path, &st) == 0) {
+      if(S_ISDIR(st.st_mode)) {
+        return ftp_active_printf(env, "550 Target is a directory\r\n");
+      }
+    } else if(errno != ENOENT) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_probe_destination(dst_path, 0, create_parent_dirs) != 0) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_prepare_total(src_path, src_st, dst_path, 0,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
+
+    task = ftp_copy_create_task(env, op, FTP_COPY_REG,
+                                src_path, dst_path, total_bytes);
+    if(!task) {
+      return ftp_perror(env);
+    }
+    return ftp_copy_start_task(env, task);
+  }
+
+  if(S_ISDIR(src_st->st_mode)) {
+    size_t src_len = strlen(src_path);
+
+    if(strncmp(dst_path, src_path, src_len) == 0 &&
+       (dst_path[src_len] == '/' || dst_path[src_len] == '\0')) {
+      return ftp_active_printf(env, "553 Cannot move into itself\r\n");
+    }
+    if(lstat(dst_path, &st) == 0) {
+      int empty;
+
+      if(!S_ISDIR(st.st_mode)) {
+        return ftp_active_printf(env, "550 Not a directory\r\n");
+      }
+      empty = ftp_dir_is_empty(dst_path);
+      if(empty < 0) {
+        return ftp_perror(env);
+      }
+      if(!empty) {
+        return ftp_active_printf(env, "550 Target already exists\r\n");
+      }
+    } else if(errno != ENOENT) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_probe_destination(dst_path, 1, create_parent_dirs) != 0) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_prepare_total(src_path, src_st, dst_path, 1,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
+
+    task = ftp_copy_create_task(env, op, FTP_COPY_DIR,
+                                src_path, dst_path, total_bytes);
+    if(!task) {
+      return ftp_perror(env);
+    }
+    return ftp_copy_start_task(env, task);
+  }
+
+  if(S_ISLNK(src_st->st_mode)) {
+    if(lstat(dst_path, &st) == 0) {
+      if(S_ISDIR(st.st_mode)) {
+        return ftp_active_printf(env, "550 Target is a directory\r\n");
+      }
+    } else if(errno != ENOENT) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_probe_destination(dst_path, 0, create_parent_dirs) != 0) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_prepare_total(src_path, src_st, dst_path, 0,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
+
+    task = ftp_copy_create_task(env, op, FTP_COPY_SYMLINK,
+                                src_path, dst_path, total_bytes);
+    if(!task) {
+      return ftp_perror(env);
+    }
+    return ftp_copy_start_task(env, task);
+  }
+
+  return ftp_active_printf(env, "550 Unsupported file type\r\n");
 }
 
 /**
@@ -3586,6 +4459,7 @@ ftp_mkdirs_parent(const char *path) {
 static int
 ftp_copy_file(const char *src_path, const char *dst_path,
               void *buf, size_t bufsize, ftp_copy_task_t *task) {
+  char tmp_path[PATH_MAX];
 #ifdef O_CLOEXEC
   int src_flags = O_RDONLY | O_CLOEXEC;
 #else
@@ -3594,35 +4468,43 @@ ftp_copy_file(const char *src_path, const char *dst_path,
 #ifdef O_NOFOLLOW
   src_flags |= O_NOFOLLOW;
 #endif
-  int src_fd = open(src_path, src_flags, 0);
+  int src_fd = -1;
+  int dst_fd = -1;
+  int free_buf = 0;
+  int saved_errno = 0;
+  void *tmp = buf;
+  size_t tmp_size = bufsize;
+
+  src_fd = open(src_path, src_flags, 0);
   if(src_fd < 0) {
     return -1;
   }
 
-#ifdef O_CLOEXEC
-  int dst_flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
-#else
-  int dst_flags = O_WRONLY | O_CREAT | O_TRUNC;
-#endif
-#ifdef O_NOFOLLOW
-  dst_flags |= O_NOFOLLOW;
-#endif
-  int dst_fd = open(dst_path, dst_flags, 0777);
-  if(dst_fd < 0) {
+  if(ftp_make_temp_path(dst_path, tmp_path, sizeof(tmp_path)) != 0) {
+    saved_errno = errno;
     close(src_fd);
+    errno = saved_errno;
     return -1;
   }
 
-  void *tmp = buf;
-  size_t tmp_size = bufsize;
-  int free_buf = 0;
+  dst_fd = mkstemp(tmp_path);
+  if(dst_fd < 0) {
+    saved_errno = errno;
+    close(src_fd);
+    errno = saved_errno;
+    return -1;
+  }
+
   if(!tmp || !tmp_size) {
     tmp = malloc(IO_COPY_BUFSIZE);
     tmp_size = IO_COPY_BUFSIZE;
     free_buf = 1;
     if(!tmp) {
+      saved_errno = errno;
       close(src_fd);
       close(dst_fd);
+      unlink(tmp_path);
+      errno = saved_errno;
       return -1;
     }
   }
@@ -3633,22 +4515,28 @@ ftp_copy_file(const char *src_path, const char *dst_path,
       if(errno == EINTR) {
         continue;
       }
+      saved_errno = errno;
       if(free_buf) {
         free(tmp);
       }
       close(src_fd);
       close(dst_fd);
+      unlink(tmp_path);
+      errno = saved_errno;
       return -1;
     }
     if(r == 0) {
       break;
     }
     if(io_nwrite(dst_fd, tmp, (size_t)r)) {
+      saved_errno = errno;
       if(free_buf) {
         free(tmp);
       }
       close(src_fd);
       close(dst_fd);
+      unlink(tmp_path);
+      errno = saved_errno;
       return -1;
     }
     ftp_copy_progress_add(task, (uintmax_t)r);
@@ -3657,11 +4545,33 @@ ftp_copy_file(const char *src_path, const char *dst_path,
   if(free_buf) {
     free(tmp);
   }
-  close(src_fd);
-  close(dst_fd);
-  if(ftp_copy_metadata(src_path, dst_path)) {
+
+  if(close(dst_fd) != 0) {
+    saved_errno = errno;
+    close(src_fd);
+    unlink(tmp_path);
+    errno = saved_errno;
     return -1;
   }
+  dst_fd = -1;
+
+  if(ftp_copy_metadata(src_path, tmp_path)) {
+    saved_errno = errno;
+    close(src_fd);
+    unlink(tmp_path);
+    errno = saved_errno;
+    return -1;
+  }
+
+  if(rename(tmp_path, dst_path) != 0) {
+    saved_errno = errno;
+    close(src_fd);
+    unlink(tmp_path);
+    errno = saved_errno;
+    return -1;
+  }
+
+  close(src_fd);
   return 0;
 }
 
@@ -3696,20 +4606,13 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
   }
 
   for(;;) {
-    errno = 0;
-    ent = readdir(dir);
-    if(!ent) {
-      if(errno) {
+    int rc = ftp_dir_next_entry(dir, &ent);
+    if(rc <= 0) {
+      if(rc < 0) {
         saved_errno = errno;
         res = -1;
       }
       break;
-    }
-
-    if(ent->d_name[0] == '.' &&
-       (ent->d_name[1] == '\0' ||
-        (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
-      continue;
     }
 
     char src_path[PATH_MAX];
@@ -3721,7 +4624,7 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
       break;
     }
 
-    if(lstat(src_path, &st)) {
+    if(ftp_dir_child_lstat(dir, src_dir, ent->d_name, &st) != 0) {
       saved_errno = errno;
       res = -1;
       break;
@@ -3804,17 +4707,6 @@ ftp_copy_thread(void *arg) {
 
   ftp_copy_notify_start(task);
 
-  if(task->kind == FTP_COPY_DIR && task->progress.total_bytes == 0) {
-    struct stat st;
-
-    if(lstat(task->src, &st)) {
-      rc = -1;
-    } else if(ftp_copy_total_for_stat(task->src, &st,
-                                      &task->progress.total_bytes)) {
-      rc = -1;
-    }
-  }
-
   if(task->kind == FTP_COPY_REG || task->kind == FTP_COPY_DIR) {
     bufsize = IO_COPY_BUFSIZE;
     buf = malloc(bufsize);
@@ -3846,6 +4738,11 @@ ftp_copy_thread(void *arg) {
   }
 
   if(rc) {
+    saved_errno = errno;
+  }
+
+  if(!rc && ftp_move_remove_source(task) != 0) {
+    rc = -1;
     saved_errno = errno;
   }
 
@@ -3893,9 +4790,6 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
   if(lstat(env->copy_path, &src_st)) {
     return ftp_perror(env);
   }
-  if(S_ISREG(src_st.st_mode) || S_ISLNK(src_st.st_mode)) {
-    total_bytes = (uintmax_t)src_st.st_size;
-  }
 
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), path_arg)) {
     return ftp_perror(env);
@@ -3907,18 +4801,22 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
   if(S_ISREG(src_st.st_mode)) {
     ftp_copy_task_t *task;
 
-    if(ftp_mkdirs_parent(pathbuf)) {
-      return ftp_perror(env);
-    }
     if(lstat(pathbuf, &st) == 0) {
-      if(!S_ISREG(st.st_mode)) {
-        return ftp_active_printf(env, "550 Not a regular file\r\n");
+      if(S_ISDIR(st.st_mode)) {
+        return ftp_active_printf(env, "550 Target is a directory\r\n");
       }
     } else if(errno != ENOENT) {
       return ftp_perror(env);
     }
+    if(ftp_copy_probe_destination(pathbuf, 0, 1) != 0) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_prepare_total(env->copy_path, &src_st, pathbuf, 0,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
 
-    task = ftp_copy_create_task(env, FTP_COPY_REG,
+    task = ftp_copy_create_task(env, FTP_BG_COPY, FTP_COPY_REG,
                                 env->copy_path, pathbuf, total_bytes);
     if(!task) {
       return ftp_perror(env);
@@ -3934,9 +4832,6 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
        (pathbuf[src_len] == '/' || pathbuf[src_len] == '\0')) {
       return ftp_active_printf(env, "553 Cannot copy into itself\r\n");
     }
-    if(ftp_mkdirs_parent(pathbuf)) {
-      return ftp_perror(env);
-    }
     if(lstat(pathbuf, &st) == 0) {
       if(!S_ISDIR(st.st_mode)) {
         return ftp_active_printf(env, "550 Not a directory\r\n");
@@ -3944,8 +4839,15 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
     } else if(errno != ENOENT) {
       return ftp_perror(env);
     }
+    if(ftp_copy_probe_destination(pathbuf, 1, 1) != 0) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_prepare_total(env->copy_path, &src_st, pathbuf, 1,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
 
-    task = ftp_copy_create_task(env, FTP_COPY_DIR,
+    task = ftp_copy_create_task(env, FTP_BG_COPY, FTP_COPY_DIR,
                                 env->copy_path, pathbuf, total_bytes);
     if(!task) {
       return ftp_perror(env);
@@ -3957,21 +4859,20 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
     ftp_copy_task_t *task;
 
     if(lstat(pathbuf, &st) == 0) {
-      if(S_ISLNK(st.st_mode)) {
-        if(unlink(pathbuf)) {
-          return ftp_perror(env);
-        }
-      } else {
-        return ftp_active_printf(env, "550 Target already exists\r\n");
+      if(S_ISDIR(st.st_mode)) {
+        return ftp_active_printf(env, "550 Target is a directory\r\n");
       }
     } else if(errno != ENOENT) {
       return ftp_perror(env);
     }
-
-    if(ftp_mkdirs_parent(pathbuf)) {
+    if(ftp_copy_probe_destination(pathbuf, 0, 1) != 0) {
       return ftp_perror(env);
     }
-    task = ftp_copy_create_task(env, FTP_COPY_SYMLINK,
+    if(ftp_copy_prepare_total(env->copy_path, &src_st, pathbuf, 0,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
+    task = ftp_copy_create_task(env, FTP_BG_COPY, FTP_COPY_SYMLINK,
                                 env->copy_path, pathbuf, total_bytes);
     if(!task) {
       return ftp_perror(env);
@@ -4019,25 +4920,26 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
   if(lstat(src_path, &src_st)) {
     return ftp_perror(env);
   }
-  if(S_ISREG(src_st.st_mode) || S_ISLNK(src_st.st_mode)) {
-    total_bytes = (uintmax_t)src_st.st_size;
-  }
 
   if(S_ISREG(src_st.st_mode)) {
     ftp_copy_task_t *task;
 
-    if(ftp_mkdirs_parent(dst_path)) {
-      return ftp_perror(env);
-    }
     if(lstat(dst_path, &st) == 0) {
-      if(!S_ISREG(st.st_mode)) {
-        return ftp_active_printf(env, "550 Not a regular file\r\n");
+      if(S_ISDIR(st.st_mode)) {
+        return ftp_active_printf(env, "550 Target is a directory\r\n");
       }
     } else if(errno != ENOENT) {
       return ftp_perror(env);
     }
+    if(ftp_copy_probe_destination(dst_path, 0, 1) != 0) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_prepare_total(src_path, &src_st, dst_path, 0,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
 
-    task = ftp_copy_create_task(env, FTP_COPY_REG,
+    task = ftp_copy_create_task(env, FTP_BG_COPY, FTP_COPY_REG,
                                 src_path, dst_path, total_bytes);
     if(!task) {
       return ftp_perror(env);
@@ -4053,9 +4955,6 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
        (dst_path[src_len] == '/' || dst_path[src_len] == '\0')) {
       return ftp_active_printf(env, "553 Cannot copy into itself\r\n");
     }
-    if(ftp_mkdirs_parent(dst_path)) {
-      return ftp_perror(env);
-    }
     if(lstat(dst_path, &st) == 0) {
       if(!S_ISDIR(st.st_mode)) {
         return ftp_active_printf(env, "550 Not a directory\r\n");
@@ -4063,8 +4962,15 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
     } else if(errno != ENOENT) {
       return ftp_perror(env);
     }
+    if(ftp_copy_probe_destination(dst_path, 1, 1) != 0) {
+      return ftp_perror(env);
+    }
+    if(ftp_copy_prepare_total(src_path, &src_st, dst_path, 1,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
 
-    task = ftp_copy_create_task(env, FTP_COPY_DIR,
+    task = ftp_copy_create_task(env, FTP_BG_COPY, FTP_COPY_DIR,
                                 src_path, dst_path, total_bytes);
     if(!task) {
       return ftp_perror(env);
@@ -4076,21 +4982,20 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
     ftp_copy_task_t *task;
 
     if(lstat(dst_path, &st) == 0) {
-      if(S_ISLNK(st.st_mode)) {
-        if(unlink(dst_path)) {
-          return ftp_perror(env);
-        }
-      } else {
-        return ftp_active_printf(env, "550 Target already exists\r\n");
+      if(S_ISDIR(st.st_mode)) {
+        return ftp_active_printf(env, "550 Target is a directory\r\n");
       }
     } else if(errno != ENOENT) {
       return ftp_perror(env);
     }
-
-    if(ftp_mkdirs_parent(dst_path)) {
+    if(ftp_copy_probe_destination(dst_path, 0, 1) != 0) {
       return ftp_perror(env);
     }
-    task = ftp_copy_create_task(env, FTP_COPY_SYMLINK,
+    if(ftp_copy_prepare_total(src_path, &src_st, dst_path, 0,
+                              &total_bytes) != 0) {
+      return ftp_perror(env);
+    }
+    task = ftp_copy_create_task(env, FTP_BG_COPY, FTP_COPY_SYMLINK,
                                 src_path, dst_path, total_bytes);
     if(!task) {
       return ftp_perror(env);
@@ -4471,6 +5376,7 @@ ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
                            " SITE CPFR\r\n"
                            " SITE CPTO\r\n"
                            " SITE COPY\r\n"
+                           " SITE MOVE\r\n"
                            " SITE AUTHID\r\n"
                            " UTF8\r\n"
                            " REST STREAM\r\n"
@@ -4656,7 +5562,7 @@ ftp_cmd_HELP(ftp_env_t *env, const char *arg) {
                            " LIST NLST MLSD MLST RETR STOR APPE\r\n"
                            " DELE RMD RMDA MKD RNFR RNTO REST XQUOTA\r\n"
                            " PASV PORT EPSV EPRT SYST NOOP QUIT\r\n"
-                           " SITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY AUTHID\r\n"
+                           " SITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY MOVE AUTHID\r\n"
                            "214 End\r\n");
 }
 
