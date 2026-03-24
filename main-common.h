@@ -14,53 +14,36 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
-#include <signal.h>
+#pragma once
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
 
-#include "log.h"
-#include "main-common.h"
-#include "srv.h"
-
-int
-main(int argc, char* argv[]) {
-  uint16_t port = 2121;
-  int notify_user = 1;
-  int c;
-
-  while((c=getopt(argc, argv, "p:h")) != -1) {
-    switch(c) {
-    case 'p':
-      if(ftp_parse_port_arg(optarg, &port) != 0) {
-        ftp_print_usage(argv[0]);
-        return 1;
-      }
-      break;
-
-    case 'h':
-      ftp_print_usage(argv[0]);
-      return 0;
-
-    default:
-      ftp_print_usage(argv[0]);
-      return 1;
-    }
-  }
-
-  signal(SIGPIPE, SIG_IGN);
-
-  while(1) {
-    ftp_serve(port, notify_user);
-    notify_user = 0;
-    sleep(3);
-  }
-
-  return 0;
+static inline void
+ftp_print_usage(const char *progname) {
+  printf("usage: %s [-p PORT]\n", progname);
+  puts("");
+  puts("options:");
+  puts("    -p PORT    Bind the socket server to the given PORT (default: 2121)");
 }
 
+static inline int
+ftp_parse_port_arg(const char *arg, uint16_t *port_out) {
+  char *endptr = NULL;
+  unsigned long port;
 
-/*
-  Local Variables:
-  c-file-style: "gnu"
-  End:
-*/
+  if(!arg || !port_out) {
+    return -1;
+  }
+
+  errno = 0;
+  port = strtoul(arg, &endptr, 10);
+  if(errno || endptr == arg || *endptr || port == 0 || port > 65535UL) {
+    return -1;
+  }
+
+  *port_out = (uint16_t)port;
+  return 0;
+}

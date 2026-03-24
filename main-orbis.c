@@ -24,6 +24,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <ps4/kernel.h>
 
+#include "main-common.h"
 #include "srv.h"
 #include "log.h"
 
@@ -80,22 +81,25 @@ main(int argc, char* argv[]) {
   uint16_t port = 2121;
   int notify_user = 1;
   pid_t pid;
-  char c;
+  int c;
 
   syscall(SYS_thr_set_name, -1, "ftpsrv.elf");
 
   while((c=getopt(argc, argv, "p:h")) != -1) {
     switch(c) {
     case 'p':
-      port = atoi(optarg);
+      if(ftp_parse_port_arg(optarg, &port) != 0) {
+        ftp_print_usage(argv[0]);
+        return EXIT_FAILURE;
+      }
       break;
 
     case 'h':
+      ftp_print_usage(argv[0]);
+      return EXIT_SUCCESS;
+
     default:
-      printf("usage: %s [-p PORT]\n", argv[0]);
-      puts("");
-      printf("options:");
-      printf("    -p PORT    Bind the socket server to the given PORT (default: 2121)\n");
+      ftp_print_usage(argv[0]);
       return EXIT_FAILURE;
     }
   }
