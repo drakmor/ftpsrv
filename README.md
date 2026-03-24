@@ -29,6 +29,7 @@ These commands are implemented but were not previously documented here:
  - SITE SYMLINK <target> <link> - create a symlink.
  - SITE CPFR <from> / SITE CPTO <to> - server-side copy (asynchronous).
  - SITE COPY <from> <to> - server-side copy (asynchronous).
+ - SITE MOVE <from> <to> - server-side move (asynchronous).
  - SITE AUTHID <hex_authid> - set process AuthID (PS5 only).
 
 Note: the copy commands return immediately with "250 Copy started in background";
