@@ -24,6 +24,8 @@ else
 endif
 
 ELF := ftpsrv-ps5.elf
+ELF_STRIP := $(firstword $(wildcard $(PS5_PAYLOAD_SDK)/bin/prospero-llvm-strip) \
+	$(wildcard $(PS5_PAYLOAD_SDK)/bin/prospero-strip))
 
 VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)
 
@@ -36,6 +38,7 @@ all: $(ELF)
 
 $(ELF): $(SOURCE)
 	$(CC) $(CFLAGS) -o $@ $^
+	@$(if $(ELF_STRIP),$(ELF_STRIP) --strip-all $@,:)
 
 clean:
 	rm -f *.elf
