@@ -25,10 +25,12 @@ jobs:
     - name: Setup SDK
       working-directory: sdk
       run: |
+        SDK_ROOT=${{ runner.tool_cache }}/ps5-payload-sdk
         sudo apt update
-        sudo apt install clang-18 lld-18 cmake
-        make DESTDIR=${{ runner.tool_cache }}/ps5-payload-sdk clean install
-        echo PS5_PAYLOAD_SDK=${{ runner.tool_cache }}/ps5-payload-sdk >> $GITHUB_ENV
+        sudo apt install clang-18 lld-18 mingw-w64 cmake
+        make DESTDIR="$SDK_ROOT" clean install
+        PS5_PAYLOAD_SDK="$SDK_ROOT" ./libcxx.sh
+        echo PS5_PAYLOAD_SDK="$SDK_ROOT" >> $GITHUB_ENV
 
     - name: Checkout Payload
       uses: actions/checkout@v4

@@ -25,10 +25,12 @@ jobs:
     - name: Setup SDK
       working-directory: sdk
       run: |
+        SDK_ROOT=${{ runner.tool_cache }}/ps4-payload-sdk
         sudo apt update
         sudo apt install clang-18 lld-18 cmake
-        make DESTDIR=${{ runner.tool_cache }}/ps4-payload-sdk clean install
-        echo PS4_PAYLOAD_SDK=${{ runner.tool_cache }}/ps4-payload-sdk >> $GITHUB_ENV
+        make DESTDIR="$SDK_ROOT" clean install
+        PS4_PAYLOAD_SDK="$SDK_ROOT" ./libcxx.sh
+        echo PS4_PAYLOAD_SDK="$SDK_ROOT" >> $GITHUB_ENV
 
     - name: Checkout Payload
       uses: actions/checkout@v4
