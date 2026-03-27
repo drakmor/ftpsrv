@@ -40,7 +40,7 @@ AOCL_CFLAGS := -I$(AOCL_DIR) -I$(AOCL_BUILD_DIR) -I$(AOCL_DIR)/algos/zlib -I$(AO
 
 ifeq ($(USE_AOCL_ZLIB),1)
 ZLIB_CFLAGS := $(AOCL_CFLAGS)
-ZLIB_LIBS := $(AOCL_LIB) -lc++ -lc++abi -lm
+	ZLIB_LIBS := $(AOCL_LIB) -lc++ -lc++abi
 else
 ZLIB_CFLAGS := $(shell $(PKG_CONFIG) --cflags zlib)
 ZLIB_LIBS := $(shell $(PKG_CONFIG) --libs zlib)
