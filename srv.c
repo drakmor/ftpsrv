@@ -31,6 +31,7 @@ along with this program; see the file COPYING. If not, see
 #include "cmd.h"
 #include "io.h"
 #include "log.h"
+#include "modez.h"
 #include "notify.h"
 
 #ifndef FTP_MAX_LINE
@@ -331,6 +332,7 @@ ftp_thread(void *args) {
   env.active_fd   = (int)(long)args;
 
   env.type        = 'I';
+  ftp_mode_z_session_init(&env);
   env.data_offset = 0;
   env.data_offset_is_rest = 0;
   env.self2elf    = 0;
@@ -355,6 +357,7 @@ ftp_thread(void *args) {
   if(!env.xfer_buf) {
     env.xfer_buf_size = 0;
   }
+
   memset(&reader, 0, sizeof(reader));
   reader.fd = env.active_fd;
 
@@ -403,9 +406,7 @@ ftp_thread(void *args) {
     close(env.passive_fd);
   }
 
-  if(env.data_fd >= 0) {
-    close(env.data_fd);
-  }
+  ftp_data_close(&env);
 
   if(env.xfer_buf) {
     free(env.xfer_buf);

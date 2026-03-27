@@ -26,6 +26,8 @@ along with this program; see the file COPYING. If not, see
 #define FTP_LISTEN_BACKLOG 64
 #endif
 
+struct ftp_mode_z;
+
 
 /**
  * Data structure that captures the current state of a client.
@@ -37,8 +39,11 @@ typedef struct ftp_env {
   char cwd[PATH_MAX];
 
   char type;
+  char mode;
   int self2elf;
   int self_verify;
+  int mode_z_level;
+  int mode_z_extra;
   off_t data_offset;
   int data_offset_is_rest;
   char rename_path[PATH_MAX];
@@ -57,6 +62,7 @@ typedef struct ftp_env {
   struct sockaddr_in data_addr;
   void *xfer_buf;
   size_t xfer_buf_size;
+  struct ftp_mode_z *mode_z;
 } ftp_env_t;
 
 

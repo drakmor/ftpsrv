@@ -17,7 +17,7 @@ jobs:
     steps:
 
     - name: Checkout SDK
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         repository: ps5-payload-dev/sdk
         path: sdk
@@ -26,12 +26,14 @@ jobs:
       working-directory: sdk
       run: |
         sudo apt update
-        sudo apt install clang-18 lld-18
+        sudo apt install clang-18 lld-18 cmake
         make DESTDIR=${{ runner.tool_cache }}/ps5-payload-sdk clean install
         echo PS5_PAYLOAD_SDK=${{ runner.tool_cache }}/ps5-payload-sdk >> $GITHUB_ENV
 
     - name: Checkout Payload
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Build Payload
       run: |

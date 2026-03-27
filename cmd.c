@@ -22,6 +22,7 @@ along with this program; see the file COPYING. If not, see
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@ along with this program; see the file COPYING. If not, see
 #include "cmd.h"
 #include "io.h"
 #include "log.h"
+#include "modez.h"
 #include "notify.h"
 #include "self.h"
 
@@ -51,7 +53,91 @@ along with this program; see the file COPYING. If not, see
 
 #define DISABLE_ASCII_MODE
 
+#ifndef FTP_DATA_CONNECT_TIMEOUT_SEC
+#define FTP_DATA_CONNECT_TIMEOUT_SEC 300
+#endif
+
 // #define IO_USE_SENDFILE  // Disabled. Speed x2 down ?!
+
+static int
+ftp_wait_fd_ready(int fd, short events, int timeout_sec) {
+  struct pollfd pfd;
+  int timeout_ms;
+
+  memset(&pfd, 0, sizeof(pfd));
+  pfd.fd = fd;
+  pfd.events = events;
+  timeout_ms = timeout_sec > 0 ? timeout_sec * 1000 : -1;
+
+  for(;;) {
+    int rc = poll(&pfd, 1, timeout_ms);
+    if(rc > 0) {
+      return 0;
+    }
+    if(rc == 0) {
+#ifdef ETIMEDOUT
+      errno = ETIMEDOUT;
+#else
+      errno = EAGAIN;
+#endif
+      return -1;
+    }
+    if(errno == EINTR) {
+      continue;
+    }
+    return -1;
+  }
+}
+
+static int
+ftp_connect_active_data(ftp_env_t *env) {
+  int flags;
+  int so_error;
+  socklen_t so_error_len;
+
+  flags = fcntl(env->data_fd, F_GETFL, 0);
+  if(flags < 0) {
+    return -1;
+  }
+  if(fcntl(env->data_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    return -1;
+  }
+
+  if(connect(env->data_fd, (struct sockaddr*)&env->data_addr,
+             sizeof(env->data_addr)) != 0) {
+    if(errno != EINPROGRESS
+#ifdef EWOULDBLOCK
+       && errno != EWOULDBLOCK
+#endif
+    ) {
+      (void)fcntl(env->data_fd, F_SETFL, flags);
+      return -1;
+    }
+    if(ftp_wait_fd_ready(env->data_fd, POLLOUT, FTP_DATA_CONNECT_TIMEOUT_SEC)) {
+      (void)fcntl(env->data_fd, F_SETFL, flags);
+      return -1;
+    }
+
+    so_error = 0;
+    so_error_len = sizeof(so_error);
+    if(getsockopt(env->data_fd, SOL_SOCKET, SO_ERROR, &so_error,
+                  &so_error_len) < 0) {
+      (void)fcntl(env->data_fd, F_SETFL, flags);
+      return -1;
+    }
+    if(so_error) {
+      (void)fcntl(env->data_fd, F_SETFL, flags);
+      errno = so_error;
+      return -1;
+    }
+  }
+
+  if(fcntl(env->data_fd, F_SETFL, flags) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
 
 
 /**
@@ -167,17 +253,16 @@ ftp_data_open(ftp_env_t *env) {
         return -1;
       }
     }
-    while(connect(env->data_fd, (struct sockaddr*)&env->data_addr,
-                  sizeof(env->data_addr)) != 0) {
-      if(errno == EINTR) {
-        continue;
-      }
+    if(ftp_connect_active_data(env)) {
       ftp_data_close(env);
       return -1;
     }
   } else {
     if(env->passive_fd < 0) {
       errno = ENOTCONN;
+      return -1;
+    }
+    if(ftp_wait_fd_ready(env->passive_fd, POLLIN, FTP_DATA_CONNECT_TIMEOUT_SEC)) {
       return -1;
     }
     addr_len = sizeof(data_addr);
@@ -223,6 +308,9 @@ ftp_data_open(ftp_env_t *env) {
  **/
 static ssize_t
 ftp_data_read(ftp_env_t *env, void *buf, size_t count) {
+  if(env->mode_z) {
+    return ftp_mode_z_read(env, buf, count);
+  }
   for(;;) {
     ssize_t r = recv(env->data_fd, buf, count, 0);
     if(r < 0 && errno == EINTR) {
@@ -230,6 +318,17 @@ ftp_data_read(ftp_env_t *env, void *buf, size_t count) {
     }
     return r;
   }
+}
+
+/**
+ * Write data to an existing data connection.
+ **/
+static int
+ftp_data_write(ftp_env_t *env, const void *buf, size_t count) {
+  if(env->mode_z) {
+    return ftp_mode_z_write(env, buf, count);
+  }
+  return io_nwrite(env->data_fd, buf, count);
 }
 
 /**
@@ -302,14 +401,14 @@ ftp_copy_ascii_out(ftp_env_t *env, int fd_in) {
       outbuf[out_len++] = (char)c;
     }
 
-    if(out_len && io_nwrite(env->data_fd, outbuf, out_len)) {
+    if(out_len && ftp_data_write(env, outbuf, out_len)) {
       goto error;
     }
   }
 
   if(prev_cr) {
     outbuf[0] = '\r';
-    if(io_nwrite(env->data_fd, outbuf, 1)) {
+    if(ftp_data_write(env, outbuf, 1)) {
       goto error;
     }
   }
@@ -324,6 +423,65 @@ error:
   free(outbuf);
   if(free_in) {
     free(inbuf);
+  }
+  return -1;
+}
+
+/**
+ * Copy file data to the data socket.
+ **/
+static int
+ftp_copy_binary_out(ftp_env_t *env, int fd_in, size_t remaining) {
+  char *buf = env->xfer_buf;
+  size_t bufsize = env->xfer_buf_size;
+  int free_buf = 0;
+
+  if(!buf || !bufsize) {
+    buf = malloc(IO_COPY_BUFSIZE);
+    bufsize = IO_COPY_BUFSIZE;
+    free_buf = 1;
+    if(!buf) {
+      return -1;
+    }
+  }
+
+  while(remaining) {
+    size_t chunk = remaining;
+    ssize_t r;
+
+    if(chunk > bufsize) {
+      chunk = bufsize;
+    }
+
+    for(;;) {
+      r = read(fd_in, buf, chunk);
+      if(r < 0 && errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    if(r < 0) {
+      goto error;
+    }
+    if(r == 0) {
+      errno = EIO;
+      goto error;
+    }
+    if(ftp_data_write(env, buf, (size_t)r)) {
+      goto error;
+    }
+
+    remaining -= (size_t)r;
+  }
+
+  if(free_buf) {
+    free(buf);
+  }
+  return 0;
+
+error:
+  if(free_buf) {
+    free(buf);
   }
   return -1;
 }
@@ -364,7 +522,7 @@ ftp_copy_ascii_in(ftp_env_t *env, int fd_out, off_t *out_off) {
   }
 
   for(;;) {
-    ssize_t r = recv(env->data_fd, inbuf, bufsize, 0);
+    ssize_t r = ftp_data_read(env, inbuf, bufsize);
     size_t out_len = 0;
 
     if(r < 0) {
@@ -435,12 +593,32 @@ error:
 int
 ftp_data_close(ftp_env_t *env) {
   int rc = 0;
+
+  (void)ftp_mode_z_xfer_finish(env, 0);
   if(env->data_fd >= 0) {
     if(close(env->data_fd)) {
       rc = -1;
     }
     env->data_fd = -1;
   }
+  return rc;
+}
+
+/**
+ * Finalize a successful data transfer before closing the socket.
+ **/
+static int
+ftp_data_xfer_complete(ftp_env_t *env) {
+  int rc = 0;
+
+  if(ftp_mode_z_xfer_finish(env, 1)) {
+    rc = -1;
+  }
+  if(env->data_fd >= 0 && close(env->data_fd)) {
+    rc = -1;
+  }
+  env->data_fd = -1;
+
   return rc;
 }
 
@@ -611,6 +789,11 @@ ftp_errno_is_timeout(int e) {
 static int
 ftp_data_xfer_error_reply(ftp_env_t *env) {
   int e = errno;
+#ifdef EPROTO
+  if(e == EPROTO && (env->mode == 'Z' || env->mode == 'z')) {
+    return ftp_active_printf(env, "426 Invalid MODE Z data stream\r\n");
+  }
+#endif
   if(e == EPIPE
 #ifdef ECONNRESET
      || e == ECONNRESET
@@ -637,6 +820,9 @@ ftp_data_open_error_reply(ftp_env_t *env) {
   if(e == EACCES) {
     return ftp_active_printf(env, "425 Can't open data connection\r\n");
   }
+  if(ftp_errno_is_timeout(e)) {
+    return ftp_active_printf(env, "425 Data connection timed out\r\n");
+  }
   errno = e;
   return ftp_perror(env);
 }
@@ -661,17 +847,34 @@ ftp_data_precheck(ftp_env_t *env) {
  * Send 150 and open the data connection, with optional precheck.
  **/
 static int
-ftp_data_xfer_start(ftp_env_t *env, int prechecked) {
+ftp_data_xfer_start(ftp_env_t *env, int prechecked, int is_send) {
   if(!prechecked) {
     int precheck = ftp_data_precheck(env);
     if(precheck) {
       return precheck;
     }
   }
+  if(ftp_mode_z_xfer_start(env, is_send)) {
+    int saved_errno = errno;
+    ftp_data_close(env);
+    errno = saved_errno;
+    if(env->mode == 'Z' || env->mode == 'z') {
+      int err = ftp_active_printf(env, "451 MODE Z is temporarily unavailable\r\n");
+      if(err < 0) {
+        return -1;
+      }
+      return 1;
+    }
+    return -1;
+  }
   if(ftp_active_printf(env, "150 Opening data transfer\r\n")) {
+    ftp_data_close(env);
     return -1;
   }
   if(ftp_data_open(env)) {
+    int saved_errno = errno;
+    ftp_data_close(env);
+    errno = saved_errno;
     int err = ftp_data_open_error_reply(env);
     if(err < 0) {
       return -1;
@@ -1264,7 +1467,7 @@ ftp_xfer_write_raw(ftp_xfer_buf_t *x, const void *data, size_t len) {
   if(x->failed) {
     return -1;
   }
-  if(io_nwrite(x->env->data_fd, data, len)) {
+  if(ftp_data_write(x->env, data, len)) {
     (void)ftp_data_xfer_error_reply(x->env);
     x->failed = 1;
     return -1;
@@ -1390,7 +1593,7 @@ ftp_list_xfer_start(ftp_env_t *env, DIR *dir, ftp_xfer_buf_t *x) {
     }
   }
 
-  int open_err = ftp_data_xfer_start(env, 0);
+  int open_err = ftp_data_xfer_start(env, 0, 1);
   if(open_err) {
     ftp_xfer_buf_release(x);
     if(dir) {
@@ -1411,8 +1614,8 @@ ftp_list_xfer_finish(ftp_env_t *env, DIR *dir, ftp_xfer_buf_t *x) {
     (void)ftp_xfer_flush(x);
   }
 
-  if(ftp_data_close(env)) {
-    (void)ftp_perror(env);
+  if(ftp_data_xfer_complete(env)) {
+    (void)ftp_data_xfer_error_reply(env);
     x->failed = 1;
   }
 
@@ -3092,7 +3295,7 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
     remaining = (size_t)(st.st_size - off);
   }
 
-  int open_err = ftp_data_xfer_start(env, 1);
+  int open_err = ftp_data_xfer_start(env, 1, 1);
   if(open_err) {
     return open_err < 0 ? open_err : 0;
   }
@@ -3117,14 +3320,22 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
     }
 
 #ifdef IO_USE_SENDFILE
-    if(io_sendfile(fd, env->data_fd, off, remaining)) {
+    if((env->mode == 'Z' || env->mode == 'z') ?
+       ftp_copy_binary_out(env, fd, remaining) :
+       io_sendfile(fd, env->data_fd, off, remaining)) {
       err = ftp_data_xfer_error_reply(env);
       ftp_data_close(env);
       return err;
     }
 #else
 
-    if(env->xfer_buf && env->xfer_buf_size) {
+    if(env->mode == 'Z' || env->mode == 'z') {
+      if(ftp_copy_binary_out(env, fd, remaining)) {
+        err = ftp_data_xfer_error_reply(env);
+        ftp_data_close(env);
+        return err;
+      }
+    } else if(env->xfer_buf && env->xfer_buf_size) {
       if(io_ncopy_buf(fd, env->data_fd, remaining, env->xfer_buf,
                       env->xfer_buf_size)) {
         err = ftp_data_xfer_error_reply(env);
@@ -3139,8 +3350,8 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
 #endif
   }
 
-  if(ftp_data_close(env)) {
-    return ftp_perror(env);
+  if(ftp_data_xfer_complete(env)) {
+    return ftp_data_xfer_error_reply(env);
   }
 
   return ftp_active_printf(env, "226 Transfer completed\r\n");
@@ -5092,7 +5303,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
   size_t bufsize = env->xfer_buf_size;
   int err = 0;
   int free_buf = 0;
-  ssize_t len;
+  ssize_t len = 0;
   struct stat st;
   int flags = O_WRONLY;
 #ifdef O_CLOEXEC
@@ -5174,7 +5385,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
     return err;
   }
 
-  int open_err = ftp_data_xfer_start(env, 1);
+  int open_err = ftp_data_xfer_start(env, 1, 0);
   if(open_err) {
     close(fd);
     return open_err < 0 ? open_err : 0;
@@ -5239,8 +5450,8 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
   }
 
   close(fd);
-  if(ftp_data_close(env)) {
-    return ftp_perror(env);
+  if(ftp_data_xfer_complete(env)) {
+    return ftp_data_xfer_error_reply(env);
   }
 
   return ftp_active_printf(env, "226 Data transfer complete\r\n");
@@ -5351,40 +5562,161 @@ ftp_cmd_PASS(ftp_env_t *env, const char *arg) {
 }
 
 /**
+ * Reset MODE Z settings to their defaults.
+ **/
+static void
+ftp_mode_z_reset_defaults(ftp_env_t *env) {
+  env->mode_z_level = FTP_MODE_Z_LEVEL_DEFAULT;
+  env->mode_z_extra = 1;
+}
+
+/**
+ * Parse the next space-delimited token.
+ **/
+static int
+ftp_next_token(const char **argp, char *buf, size_t buf_size) {
+  const char *arg = *argp;
+  size_t len;
+
+  arg += strspn(arg, " ,");
+  if(!*arg) {
+    buf[0] = '\0';
+    *argp = arg;
+    return 0;
+  }
+
+  len = strcspn(arg, " ,");
+  if(len >= buf_size) {
+    len = buf_size - 1;
+  }
+
+  memcpy(buf, arg, len);
+  buf[len] = '\0';
+
+  arg += len;
+  arg += strspn(arg, " ,");
+  *argp = arg;
+
+  return 1;
+}
+
+/**
+ * Handle OPTS MODE Z requests.
+ **/
+static int
+ftp_cmd_OPTS_mode_z(ftp_env_t *env, const char *arg) {
+  char name[32];
+  char value[32];
+  int level;
+  int extra;
+
+  if(env->mode_z) {
+    return ftp_active_printf(env, "451 MODE Z is active during transfer\r\n");
+  }
+
+  level = env->mode_z_level;
+  extra = env->mode_z_extra;
+
+  if(!*arg) {
+    ftp_mode_z_reset_defaults(env);
+    return ftp_active_printf(env, "200 MODE Z settings reset\r\n");
+  }
+
+  while(ftp_next_token(&arg, name, sizeof(name))) {
+    if(!ftp_next_token(&arg, value, sizeof(value))) {
+      return ftp_active_printf(env, "501 OPTS MODE Z requires <NAME> <VALUE>\r\n");
+    }
+
+    if(!strcasecmp(name, "ENGINE")) {
+      if(strcasecmp(value, "ZLIB")) {
+        return ftp_active_printf(env, "501 MODE Z ENGINE %s is invalid\r\n", value);
+      }
+      continue;
+    }
+
+    if(!strcasecmp(name, "METHOD")) {
+      if(strcmp(value, "8")) {
+        return ftp_active_printf(env, "501 MODE Z METHOD %s is invalid\r\n", value);
+      }
+      continue;
+    }
+
+    if(!strcasecmp(name, "LEVEL")) {
+      char *end = NULL;
+      long tmp = strtol(value, &end, 10);
+
+      if(*value == '\0' || *end || tmp < 0 || tmp > 9) {
+        return ftp_active_printf(env, "501 MODE Z LEVEL %s is invalid\r\n", value);
+      }
+      level = (int)tmp;
+      continue;
+    }
+
+    if(!strcasecmp(name, "EXTRA")) {
+      if(!strcasecmp(value, "ON")) {
+        extra = 1;
+        continue;
+      }
+      if(!strcasecmp(value, "OFF")) {
+        extra = 0;
+        continue;
+      }
+      return ftp_active_printf(env, "501 MODE Z EXTRA %s is invalid\r\n", value);
+    }
+
+    if(!strcasecmp(name, "BLOCKSIZE")) {
+      return ftp_active_printf(env, "501 MODE Z BLOCKSIZE is not available\r\n");
+    }
+
+    return ftp_active_printf(env, "501 MODE Z %s is not available\r\n", name);
+  }
+
+  env->mode_z_level = level;
+  env->mode_z_extra = extra;
+  return ftp_active_printf(env, "200 MODE Z options updated\r\n");
+}
+
+/**
  * Feature list.
  **/
 int
 ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
   (void)arg;
-  return ftp_active_printf(env,
-                           "211-Features:\r\n"
-                           " MLST type*;unique*;size*;modify*;unix.mode*;"
-                           "unix.uid*;unix.gid*;\r\n"
-                           " AVBL\r\n"
-                           " XQUOTA\r\n"
-                           " MLSD\r\n"
-                           " MDTM\r\n"
-                           " SIZE\r\n"
-                           " DSIZ\r\n"
-                           " RMDA\r\n"
-                           " EPSV\r\n"
-                           " EPRT\r\n"
-                           " KILL\r\n"
-                           " MTRW\r\n"
-                           " SELF\r\n"
-                           " SCHK\r\n"
-                           " SITE CHMOD\r\n"
-                           " SITE UMASK\r\n"
-                           " SITE SYMLINK\r\n"
-                           " SITE RMDIR\r\n"
-                           " SITE CPFR\r\n"
-                           " SITE CPTO\r\n"
-                           " SITE COPY\r\n"
-                           " SITE MOVE\r\n"
-                           " SITE AUTHID\r\n"
-                           " UTF8\r\n"
-                           " REST STREAM\r\n"
-                           "211 End\r\n");
+  if(!ftp_active_printf(env,
+                        "211-Features:\r\n"
+                        " MLST type*;unique*;size*;modify*;unix.mode*;"
+                        "unix.uid*;unix.gid*;\r\n"
+                        " AVBL\r\n"
+                        " XQUOTA\r\n"
+                        " MLSD\r\n"
+                        " MDTM\r\n"
+                        " SIZE\r\n"
+                        " DSIZ\r\n"
+                        " RMDA\r\n"
+                        " EPSV\r\n"
+                        " EPRT\r\n"
+                        " KILL\r\n"
+                        " MTRW\r\n"
+                        " SELF\r\n"
+                        " SCHK\r\n"
+                        " SITE CHMOD\r\n"
+                        " SITE UMASK\r\n"
+                        " SITE SYMLINK\r\n"
+                        " SITE RMDIR\r\n"
+                        " SITE CPFR\r\n"
+                        " SITE CPTO\r\n"
+                        " SITE COPY\r\n"
+                        " SITE MOVE\r\n"
+                        " SITE AUTHID\r\n"
+                        " UTF8\r\n")) {
+    if(ftp_active_printf(env, " MODE Z\r\n")) {
+      return -1;
+    }
+    return ftp_active_printf(env,
+                             " REST STREAM\r\n"
+                             "211 End\r\n");
+  }
+  return -1;
 }
 
 /**
@@ -5395,6 +5727,7 @@ ftp_cmd_OPTS(ftp_env_t *env, const char *arg) {
   char opt[16];
   char val[16];
   size_t len = 0;
+  const char *rest = NULL;
 
   if(!*arg) {
     return ftp_active_printf(env, "501 Usage: OPTS UTF8 ON\r\n");
@@ -5415,6 +5748,8 @@ ftp_cmd_OPTS(ftp_env_t *env, const char *arg) {
   }
   memcpy(val, arg, len);
   val[len] = '\0';
+  rest = arg + strcspn(arg, " ");
+  rest += strspn(rest, " ");
 
   if(!strcasecmp(opt, "UTF8")) {
     if(!val[0] || !strcasecmp(val, "ON")) {
@@ -5424,6 +5759,13 @@ ftp_cmd_OPTS(ftp_env_t *env, const char *arg) {
       return ftp_active_printf(env, "200 UTF8 disabled\r\n");
     }
     return ftp_active_printf(env, "501 Usage: OPTS UTF8 ON\r\n");
+  }
+
+  if(!strcasecmp(opt, "MODE")) {
+    if(strcasecmp(val, "Z")) {
+      return ftp_active_printf(env, "504 Option not supported\r\n");
+    }
+    return ftp_cmd_OPTS_mode_z(env, rest);
   }
 
   return ftp_active_printf(env, "504 Option not supported\r\n");
@@ -5575,12 +5917,16 @@ ftp_cmd_HELP(ftp_env_t *env, const char *arg) {
  **/
 int
 ftp_cmd_MODE(ftp_env_t *env, const char *arg) {
-  (void)env;
-  if(!arg[0]) {
-    return ftp_active_printf(env, "501 Usage: MODE S\r\n");
+  if(!arg[0] || arg[1] != '\0') {
+    return ftp_active_printf(env, "501 Usage: MODE <S|Z>\r\n");
   }
   if(arg[0] == 'S' || arg[0] == 's') {
+    env->mode = 'S';
     return ftp_active_printf(env, "200 Mode set to S\r\n");
+  }
+  if(arg[0] == 'Z' || arg[0] == 'z') {
+    env->mode = 'Z';
+    return ftp_active_printf(env, "200 Mode set to Z\r\n");
   }
   return ftp_active_printf(env, "504 MODE not supported\r\n");
 }

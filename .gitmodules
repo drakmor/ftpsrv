@@ -1,0 +1,4 @@
+[submodule "third_party/aocl-compression"]
+	path = third_party/aocl-compression
+	url = https://github.com/drakmor/aocl-compression.git
+	branch = amd-main

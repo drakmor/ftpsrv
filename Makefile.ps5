@@ -28,20 +28,75 @@ ELF_STRIP := $(firstword $(wildcard $(PS5_PAYLOAD_SDK)/bin/prospero-llvm-strip) 
 	$(wildcard $(PS5_PAYLOAD_SDK)/bin/prospero-strip))
 
 VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)
+USE_AOCL_ZLIB ?= 1
+DEPFLAGS := -MMD -MP
+OBJDIR := .build/ps5
 
-CFLAGS := $(CFLAGS) -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -I. -O3 -DNDEBUG -march=znver2 -mtune=znver2 -flto
-SOURCE := srv.c cmd.c notify.c io.c self.c sha256.c
+AOCL_DIR := third_party/aocl-compression
+AOCL_BUILD_DIR := $(AOCL_DIR)/build-ftpsrv-ps5
+AOCL_LIB := $(AOCL_BUILD_DIR)/libaocl_compression.a
+AOCL_TRACKED := $(addprefix $(AOCL_DIR)/,$(shell git -C $(AOCL_DIR) ls-files 2>/dev/null))
+AOCL_CFLAGS := -I$(AOCL_DIR) -I$(AOCL_BUILD_DIR) -I$(AOCL_DIR)/algos/zlib -I$(AOCL_DIR)/algos/common
+
+ifeq ($(USE_AOCL_ZLIB),1)
+ZLIB_CFLAGS := $(AOCL_CFLAGS)
+ZLIB_LIBS := $(AOCL_LIB) -lc++ -lc++abi -lm
+else
+ZLIB_CFLAGS := $(shell $(PKG_CONFIG) --cflags zlib)
+ZLIB_LIBS := $(shell $(PKG_CONFIG) --libs zlib)
+endif
+
+CFLAGS := $(CFLAGS) -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -I. $(ZLIB_CFLAGS) -O3 -DNDEBUG -march=znver2 -mtune=znver2 -flto $(DEPFLAGS)
+SOURCE := srv.c cmd.c notify.c io.c modez.c self.c sha256.c
 SOURCE += main-prospero.c cmd-prospero.c self-prospero.c
 SOURCE += io-freebsd.c
+OBJECTS := $(patsubst %.c,$(OBJDIR)/%.o,$(SOURCE))
+DEPS := $(OBJECTS:.o=.d)
 
 all: $(ELF)
 
-$(ELF): $(SOURCE)
-	$(CC) $(CFLAGS) -o $@ $^
+$(ELF): $(OBJECTS) $(if $(filter 1,$(USE_AOCL_ZLIB)),$(AOCL_LIB))
+	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(ZLIB_LIBS)
 	@$(if $(ELF_STRIP),$(ELF_STRIP) --strip-all $@,:)
 
+$(OBJDIR):
+	mkdir -p $@
+
+$(OBJDIR)/%.o: %.c | $(OBJDIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(AOCL_BUILD_DIR)/CMakeCache.txt: $(AOCL_DIR)/CMakeLists.txt
+	@test -e $(AOCL_DIR)/.git || (echo "AOCL submodule is missing. Run: git submodule update --init --recursive" && false)
+	cmake -S $(AOCL_DIR) -B $(AOCL_BUILD_DIR) \
+		-DCMAKE_TOOLCHAIN_FILE=$(PS5_PAYLOAD_SDK)/toolchain/prospero.cmake \
+		-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DBUILD_STATIC_LIBS=ON \
+		-DBUILD_EXAMPLE=OFF \
+		-DBUILD_DOC=OFF \
+		-DBUILD_UTILITY=OFF \
+		-DAOCL_ENABLE_THREADS=OFF \
+		-DAOCL_ZLIB_CONSOLE_SIMD=ON \
+		-DAOCL_ZLIB_MAX_OPT_LEVEL=3 \
+		-DNATIVE_ENABLE_THREADS=OFF \
+		-DAOCL_EXCLUDE_BZIP2=ON \
+		-DAOCL_EXCLUDE_LZ4=ON \
+		-DAOCL_EXCLUDE_LZ4HC=ON \
+		-DAOCL_EXCLUDE_LZMA=ON \
+		-DAOCL_EXCLUDE_SNAPPY=ON \
+		-DAOCL_EXCLUDE_ZSTD=ON
+
+$(AOCL_LIB): $(AOCL_BUILD_DIR)/CMakeCache.txt $(AOCL_TRACKED)
+	cmake --build $(AOCL_BUILD_DIR) --target aocl_compression -j
+
+clean-aocl:
+	rm -rf $(AOCL_BUILD_DIR)
+
 clean:
-	rm -f *.elf
+	rm -f $(ELF)
+	rm -rf $(OBJDIR)
 
 test: $(ELF)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
+
+-include $(DEPS)
