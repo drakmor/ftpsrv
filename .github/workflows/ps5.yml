@@ -19,7 +19,7 @@ jobs:
     - name: Checkout SDK
       uses: actions/checkout@v3
       with:
-        repository: ps5-payload-dev/sdk
+        repository: EchoStretch/sdk
         path: sdk
 
     - name: Setup SDK
