@@ -1499,6 +1499,41 @@ typedef enum {
   FTP_BG_MOVE,
 } ftp_bg_op_t;
 
+static pthread_mutex_t ftp_server_bg_op_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int ftp_server_bg_op_in_progress = 0;
+
+static int
+ftp_server_bg_op_acquire(void) {
+  int busy;
+
+  pthread_mutex_lock(&ftp_server_bg_op_mutex);
+  busy = ftp_server_bg_op_in_progress;
+  if(!busy) {
+    ftp_server_bg_op_in_progress = 1;
+  }
+  pthread_mutex_unlock(&ftp_server_bg_op_mutex);
+
+  return !busy;
+}
+
+static int
+ftp_server_bg_op_busy(void) {
+  int busy;
+
+  pthread_mutex_lock(&ftp_server_bg_op_mutex);
+  busy = ftp_server_bg_op_in_progress;
+  pthread_mutex_unlock(&ftp_server_bg_op_mutex);
+
+  return busy;
+}
+
+static void
+ftp_server_bg_op_release(void) {
+  pthread_mutex_lock(&ftp_server_bg_op_mutex);
+  ftp_server_bg_op_in_progress = 0;
+  pthread_mutex_unlock(&ftp_server_bg_op_mutex);
+}
+
 static void
 ftp_compact_path(const char *path, char *out, size_t out_size) {
   size_t len;
@@ -2209,26 +2244,13 @@ ftp_delete_thread_cleanup(ftp_env_t *env) {
 }
 
 static int
-ftp_bg_op_busy(ftp_env_t *env) {
-  int busy;
-
-  pthread_mutex_lock(&env->copy_mutex);
-  busy = env->copy_in_progress;
-  pthread_mutex_unlock(&env->copy_mutex);
-  if(busy) {
-    return 1;
-  }
-
-  pthread_mutex_lock(&env->delete_mutex);
-  busy = env->delete_in_progress;
-  pthread_mutex_unlock(&env->delete_mutex);
-
-  return busy;
-}
-
-static int
 ftp_delete_start_task(ftp_env_t *env, ftp_delete_task_t *task) {
   int thread_rc;
+
+  if(!ftp_server_bg_op_acquire()) {
+    free(task);
+    return ftp_active_printf(env, "450 Background file operation in progress\r\n");
+  }
 
   pthread_mutex_lock(&env->delete_mutex);
   env->delete_in_progress = 1;
@@ -2242,6 +2264,7 @@ ftp_delete_start_task(ftp_env_t *env, ftp_delete_task_t *task) {
     env->delete_in_progress = 0;
     env->delete_thread_valid = 0;
     pthread_mutex_unlock(&env->delete_mutex);
+    ftp_server_bg_op_release();
     free(task);
     errno = thread_rc;
     return ftp_perror(env);
@@ -2275,6 +2298,7 @@ ftp_delete_thread(void *arg) {
   pthread_mutex_lock(&env->delete_mutex);
   env->delete_in_progress = 0;
   pthread_mutex_unlock(&env->delete_mutex);
+  ftp_server_bg_op_release();
 
   free(task);
   return NULL;
@@ -3255,7 +3279,7 @@ ftp_cmd_RMDA(ftp_env_t *env, const char* arg) {
 
   ftp_copy_thread_cleanup(env);
   ftp_delete_thread_cleanup(env);
-  if(ftp_bg_op_busy(env)) {
+  if(ftp_server_bg_op_busy()) {
     return ftp_active_printf(env, "450 Background file operation in progress\r\n");
   }
 
@@ -3326,7 +3350,7 @@ ftp_cmd_RNTO(ftp_env_t *env, const char* arg) {
 
   ftp_copy_thread_cleanup(env);
   ftp_delete_thread_cleanup(env);
-  if(ftp_bg_op_busy(env)) {
+  if(ftp_server_bg_op_busy()) {
     return ftp_active_printf(env,
                              "450 Background file operation in progress\r\n");
   }
@@ -3411,7 +3435,7 @@ ftp_cmd_MOVE(ftp_env_t *env, const char* arg) {
 
   ftp_copy_thread_cleanup(env);
   ftp_delete_thread_cleanup(env);
-  if(ftp_bg_op_busy(env)) {
+  if(ftp_server_bg_op_busy()) {
     return ftp_active_printf(env,
                              "450 Background file operation in progress\r\n");
   }
@@ -4190,6 +4214,11 @@ static int
 ftp_copy_start_task(ftp_env_t *env, ftp_copy_task_t *task) {
   int thread_rc;
 
+  if(!ftp_server_bg_op_acquire()) {
+    free(task);
+    return ftp_active_printf(env, "450 Background file operation in progress\r\n");
+  }
+
   pthread_mutex_lock(&env->copy_mutex);
   env->copy_in_progress = 1;
   env->copy_thread_valid = 1;
@@ -4201,6 +4230,7 @@ ftp_copy_start_task(ftp_env_t *env, ftp_copy_task_t *task) {
     env->copy_in_progress = 0;
     env->copy_thread_valid = 0;
     pthread_mutex_unlock(&env->copy_mutex);
+    ftp_server_bg_op_release();
     free(task);
     errno = thread_rc;
     return ftp_perror(env);
@@ -4261,7 +4291,7 @@ ftp_move_start_background(ftp_env_t *env, ftp_bg_op_t op,
 
   ftp_copy_thread_cleanup(env);
   ftp_delete_thread_cleanup(env);
-  if(ftp_bg_op_busy(env)) {
+  if(ftp_server_bg_op_busy()) {
     return ftp_active_printf(env,
                              "450 Background file operation in progress\r\n");
   }
@@ -4759,6 +4789,7 @@ ftp_copy_thread(void *arg) {
   pthread_mutex_lock(&env->copy_mutex);
   env->copy_in_progress = 0;
   pthread_mutex_unlock(&env->copy_mutex);
+  ftp_server_bg_op_release();
 
   free(task);
   return NULL;
@@ -4778,7 +4809,7 @@ ftp_cmd_CPTO(ftp_env_t *env, const char* arg) {
 
   ftp_copy_thread_cleanup(env);
   ftp_delete_thread_cleanup(env);
-  if(ftp_bg_op_busy(env)) {
+  if(ftp_server_bg_op_busy()) {
     return ftp_active_printf(env, "450 Background file operation in progress\r\n");
   }
 
@@ -4902,7 +4933,7 @@ ftp_cmd_COPY(ftp_env_t *env, const char* arg) {
 
   ftp_copy_thread_cleanup(env);
   ftp_delete_thread_cleanup(env);
-  if(ftp_bg_op_busy(env)) {
+  if(ftp_server_bg_op_busy()) {
     return ftp_active_printf(env, "450 Background file operation in progress\r\n");
   }
 

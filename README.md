@@ -32,8 +32,10 @@ These commands are implemented but were not previously documented here:
  - SITE MOVE <from> <to> - server-side move (asynchronous).
  - SITE AUTHID <hex_authid> - set process AuthID (PS5 only).
 
-Note: the copy commands return immediately with "250 Copy started in background";
-errors during the background copy are not reported to the client.
+Note: the copy and move commands return immediately with `250 Copy started in
+background` or `250 Move started in background`; errors during the background
+operation are not reported to the client. Only one asynchronous copy, move, or
+recursive delete operation can run on the server at a time.
 
 Some clients (e.g. WinSCP) can be configured to use these extra commands
 for file management operations.
