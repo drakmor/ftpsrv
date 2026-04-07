@@ -45,6 +45,12 @@ along with this program; see the file COPYING. If not, see
 #include "notify.h"
 #include "self.h"
 
+#ifdef ECANCELED
+#define FTP_BG_OP_CANCELLED_ERR ECANCELED
+#else
+#define FTP_BG_OP_CANCELLED_ERR INT_MAX
+#endif
+
 #ifndef FTP_LIST_OUTBUF_SIZE
 #define FTP_LIST_OUTBUF_SIZE (256 * 1024)
 #endif
@@ -1501,6 +1507,7 @@ typedef enum {
 
 static pthread_mutex_t ftp_server_bg_op_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int ftp_server_bg_op_in_progress = 0;
+static int ftp_server_bg_op_cancel_requested = 0;
 
 static int
 ftp_server_bg_op_acquire(void) {
@@ -1510,6 +1517,7 @@ ftp_server_bg_op_acquire(void) {
   busy = ftp_server_bg_op_in_progress;
   if(!busy) {
     ftp_server_bg_op_in_progress = 1;
+    ftp_server_bg_op_cancel_requested = 0;
   }
   pthread_mutex_unlock(&ftp_server_bg_op_mutex);
 
@@ -1527,10 +1535,40 @@ ftp_server_bg_op_busy(void) {
   return busy;
 }
 
+static int
+ftp_server_bg_op_cancelled(void) {
+  int cancelled;
+
+  pthread_mutex_lock(&ftp_server_bg_op_mutex);
+  cancelled = ftp_server_bg_op_cancel_requested;
+  pthread_mutex_unlock(&ftp_server_bg_op_mutex);
+
+  return cancelled;
+}
+
+static int
+ftp_server_bg_op_cancel(void) {
+  int state;
+
+  pthread_mutex_lock(&ftp_server_bg_op_mutex);
+  if(!ftp_server_bg_op_in_progress) {
+    state = 0;
+  } else if(ftp_server_bg_op_cancel_requested) {
+    state = 2;
+  } else {
+    ftp_server_bg_op_cancel_requested = 1;
+    state = 1;
+  }
+  pthread_mutex_unlock(&ftp_server_bg_op_mutex);
+
+  return state;
+}
+
 static void
 ftp_server_bg_op_release(void) {
   pthread_mutex_lock(&ftp_server_bg_op_mutex);
   ftp_server_bg_op_in_progress = 0;
+  ftp_server_bg_op_cancel_requested = 0;
   pthread_mutex_unlock(&ftp_server_bg_op_mutex);
 }
 
@@ -1798,6 +1836,10 @@ ftp_delete_notify_result(const ftp_delete_task_t *task, int rc, int err) {
   if(rc) {
     if(err == 0) {
       err = EIO;
+    }
+    if(err == FTP_BG_OP_CANCELLED_ERR) {
+      notify("Delete stopped %u%%: %s", pct, task->path_notify);
+      return;
     }
     notify("Delete failed %u%%: %s (%s)",
            pct, task->path_notify, strerror(err));
@@ -2086,6 +2128,11 @@ ftp_delete_count_dir(const char *path, uintmax_t *count_out) {
   }
 
   for(;;) {
+    if(ftp_server_bg_op_cancelled()) {
+      closedir(dir);
+      errno = FTP_BG_OP_CANCELLED_ERR;
+      return -1;
+    }
     int rc = ftp_dir_next_entry(dir, &ent);
     if(rc <= 0) {
       if(rc < 0) {
@@ -2149,6 +2196,11 @@ ftp_rmda_delete_dir(const char *path, int *err_out, ftp_delete_task_t *task) {
   int failed = 0;
   struct dirent *ent;
   for(;;) {
+    if(ftp_server_bg_op_cancelled()) {
+      ftp_store_first_error(err_out, FTP_BG_OP_CANCELLED_ERR);
+      failed = 1;
+      break;
+    }
     int rc = ftp_dir_next_entry(dir, &ent);
     if(rc <= 0) {
       if(rc < 0) {
@@ -2175,6 +2227,9 @@ ftp_rmda_delete_dir(const char *path, int *err_out, ftp_delete_task_t *task) {
       }
       if(ftp_rmda_delete_dir(child, err_out, task)) {
         failed = 1;
+        if(ftp_server_bg_op_cancelled()) {
+          break;
+        }
       }
       continue;
     }
@@ -2193,6 +2248,11 @@ ftp_rmda_delete_dir(const char *path, int *err_out, ftp_delete_task_t *task) {
   }
 
   if(failed) {
+    return -1;
+  }
+
+  if(ftp_server_bg_op_cancelled()) {
+    ftp_store_first_error(err_out, FTP_BG_OP_CANCELLED_ERR);
     return -1;
   }
 
@@ -3917,9 +3977,15 @@ static int
 ftp_copy_symlink(const char *src_path, const char *dst_path) {
   char linkbuf[PATH_MAX + 1];
   char tmp_path[PATH_MAX];
-  ssize_t len = readlink(src_path, linkbuf, sizeof(linkbuf) - 1);
+  ssize_t len;
   int fd;
 
+  if(ftp_server_bg_op_cancelled()) {
+    errno = FTP_BG_OP_CANCELLED_ERR;
+    return -1;
+  }
+
+  len = readlink(src_path, linkbuf, sizeof(linkbuf) - 1);
   if(len < 0) {
     return -1;
   }
@@ -3939,6 +4005,12 @@ ftp_copy_symlink(const char *src_path, const char *dst_path) {
   }
 
   if(symlink(linkbuf, tmp_path) != 0) {
+    return -1;
+  }
+
+  if(ftp_server_bg_op_cancelled()) {
+    unlink(tmp_path);
+    errno = FTP_BG_OP_CANCELLED_ERR;
     return -1;
   }
 
@@ -4200,6 +4272,12 @@ ftp_copy_notify_result(const ftp_copy_task_t *task, int rc, int err) {
     if(err == 0) {
       err = EIO;
     }
+    if(err == FTP_BG_OP_CANCELLED_ERR) {
+      notify("%s stopped %u%%: %s -> %s",
+             ftp_bg_op_name(task->op), pct,
+             task->src_notify, task->dst_notify);
+      return;
+    }
     notify("%s failed %u%%: %s -> %s (%s)",
            ftp_bg_op_name(task->op), pct,
            task->src_notify, task->dst_notify, strerror(err));
@@ -4244,6 +4322,10 @@ static int
 ftp_move_remove_source(ftp_copy_task_t *task) {
   if(!task || task->op != FTP_BG_MOVE) {
     return 0;
+  }
+  if(ftp_server_bg_op_cancelled()) {
+    errno = FTP_BG_OP_CANCELLED_ERR;
+    return -1;
   }
 
   switch(task->kind) {
@@ -4504,10 +4586,16 @@ ftp_copy_file(const char *src_path, const char *dst_path,
 #endif
   int src_fd = -1;
   int dst_fd = -1;
+  int tmp_created = 0;
   int free_buf = 0;
   int saved_errno = 0;
   void *tmp = buf;
   size_t tmp_size = bufsize;
+
+  if(ftp_server_bg_op_cancelled()) {
+    errno = FTP_BG_OP_CANCELLED_ERR;
+    return -1;
+  }
 
   src_fd = open(src_path, src_flags, 0);
   if(src_fd < 0) {
@@ -4516,18 +4604,15 @@ ftp_copy_file(const char *src_path, const char *dst_path,
 
   if(ftp_make_temp_path(dst_path, tmp_path, sizeof(tmp_path)) != 0) {
     saved_errno = errno;
-    close(src_fd);
-    errno = saved_errno;
-    return -1;
+    goto fail;
   }
 
   dst_fd = mkstemp(tmp_path);
   if(dst_fd < 0) {
     saved_errno = errno;
-    close(src_fd);
-    errno = saved_errno;
-    return -1;
+    goto fail;
   }
+  tmp_created = 1;
 
   if(!tmp || !tmp_size) {
     tmp = malloc(IO_COPY_BUFSIZE);
@@ -4535,78 +4620,93 @@ ftp_copy_file(const char *src_path, const char *dst_path,
     free_buf = 1;
     if(!tmp) {
       saved_errno = errno;
-      close(src_fd);
-      close(dst_fd);
-      unlink(tmp_path);
-      errno = saved_errno;
-      return -1;
+      goto fail;
     }
   }
 
   for(;;) {
+    if(ftp_server_bg_op_cancelled()) {
+      saved_errno = FTP_BG_OP_CANCELLED_ERR;
+      goto fail;
+    }
     ssize_t r = read(src_fd, tmp, tmp_size);
     if(r < 0) {
       if(errno == EINTR) {
         continue;
       }
       saved_errno = errno;
-      if(free_buf) {
-        free(tmp);
-      }
-      close(src_fd);
-      close(dst_fd);
-      unlink(tmp_path);
-      errno = saved_errno;
-      return -1;
+      goto fail;
     }
     if(r == 0) {
       break;
     }
     if(io_nwrite(dst_fd, tmp, (size_t)r)) {
       saved_errno = errno;
-      if(free_buf) {
-        free(tmp);
-      }
-      close(src_fd);
-      close(dst_fd);
-      unlink(tmp_path);
-      errno = saved_errno;
-      return -1;
+      goto fail;
     }
     ftp_copy_progress_add(task, (uintmax_t)r);
   }
 
+  if(ftp_server_bg_op_cancelled()) {
+    saved_errno = FTP_BG_OP_CANCELLED_ERR;
+    goto fail;
+  }
+
   if(free_buf) {
     free(tmp);
+    tmp = NULL;
+    free_buf = 0;
   }
 
   if(close(dst_fd) != 0) {
     saved_errno = errno;
-    close(src_fd);
-    unlink(tmp_path);
-    errno = saved_errno;
-    return -1;
+    dst_fd = -1;
+    goto fail;
   }
   dst_fd = -1;
 
+  if(ftp_server_bg_op_cancelled()) {
+    saved_errno = FTP_BG_OP_CANCELLED_ERR;
+    goto fail;
+  }
+
   if(ftp_copy_metadata(src_path, tmp_path)) {
     saved_errno = errno;
-    close(src_fd);
-    unlink(tmp_path);
-    errno = saved_errno;
-    return -1;
+    goto fail;
+  }
+
+  if(ftp_server_bg_op_cancelled()) {
+    saved_errno = FTP_BG_OP_CANCELLED_ERR;
+    goto fail;
   }
 
   if(rename(tmp_path, dst_path) != 0) {
     saved_errno = errno;
-    close(src_fd);
-    unlink(tmp_path);
-    errno = saved_errno;
-    return -1;
+    goto fail;
   }
+  tmp_created = 0;
 
   close(src_fd);
   return 0;
+
+fail:
+  if(!saved_errno) {
+    saved_errno = errno;
+  }
+  if(free_buf && tmp) {
+    free(tmp);
+  }
+  if(src_fd >= 0) {
+    close(src_fd);
+  }
+  if(dst_fd >= 0) {
+    close(dst_fd);
+  }
+  if(tmp_created) {
+    unlink(tmp_path);
+  }
+  errno = saved_errno;
+  return -1;
 }
 
 /**
@@ -4620,6 +4720,11 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
   struct stat st;
   int res = 0;
   int saved_errno = 0;
+
+  if(ftp_server_bg_op_cancelled()) {
+    errno = FTP_BG_OP_CANCELLED_ERR;
+    return -1;
+  }
 
   if(lstat(dst_dir, &st) == 0) {
     if(!S_ISDIR(st.st_mode)) {
@@ -4640,6 +4745,11 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
   }
 
   for(;;) {
+    if(ftp_server_bg_op_cancelled()) {
+      saved_errno = FTP_BG_OP_CANCELLED_ERR;
+      res = -1;
+      break;
+    }
     int rc = ftp_dir_next_entry(dir, &ent);
     if(rc <= 0) {
       if(rc < 0) {
@@ -4699,6 +4809,10 @@ ftp_copy_dir(const char *src_dir, const char *dst_dir,
     errno = saved_errno;
   }
   if(res == 0) {
+    if(ftp_server_bg_op_cancelled()) {
+      errno = FTP_BG_OP_CANCELLED_ERR;
+      return -1;
+    }
     if(ftp_copy_metadata(src_dir, dst_dir)) {
       return -1;
     }
@@ -5402,6 +5516,7 @@ ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
                            " EPRT\r\n"
                            " KILL\r\n"
                            " MTRW\r\n"
+                           " STOP\r\n"
                            " SELF\r\n"
                            " SCHK\r\n"
                            " SITE CHMOD\r\n"
@@ -5412,6 +5527,7 @@ ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
                            " SITE CPTO\r\n"
                            " SITE COPY\r\n"
                            " SITE MOVE\r\n"
+                           " SITE STOP\r\n"
                            " SITE AUTHID\r\n"
                            " UTF8\r\n"
                            " REST STREAM\r\n"
@@ -5595,9 +5711,9 @@ ftp_cmd_HELP(ftp_env_t *env, const char *arg) {
                            "214-Commands:\r\n"
                            " USER PASS PWD CWD CDUP TYPE SIZE DSIZ MDTM AVBL\r\n"
                            " LIST NLST MLSD MLST RETR STOR APPE\r\n"
-                           " DELE RMD RMDA MKD RNFR RNTO REST XQUOTA\r\n"
+                           " DELE RMD RMDA MKD RNFR RNTO REST STOP XQUOTA\r\n"
                            " PASV PORT EPSV EPRT SYST NOOP QUIT\r\n"
-                           " SITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY MOVE AUTHID\r\n"
+                           " SITE CHMOD UMASK SYMLINK RMDIR CPFR CPTO COPY MOVE STOP AUTHID\r\n"
                            "214 End\r\n");
 }
 
@@ -5658,6 +5774,28 @@ ftp_cmd_ABOR(ftp_env_t *env, const char *arg) {
 
   env->data_offset = 0;
   return ftp_active_printf(env, "225 No transfer to abort\r\n");
+}
+
+/**
+ * Stop the current background file operation.
+ **/
+int
+ftp_cmd_STOP(ftp_env_t *env, const char *arg) {
+  int state;
+
+  (void)arg;
+
+  state = ftp_server_bg_op_cancel();
+  if(state == 0) {
+    return ftp_active_printf(env,
+                             "225 No background file operation to stop\r\n");
+  }
+  if(state == 1) {
+    notify("Background file operation stop requested");
+  }
+  return ftp_active_printf(env,
+                           "200 Background file operation stop %s\r\n",
+                           state == 2 ? "already requested" : "requested");
 }
 
 /**

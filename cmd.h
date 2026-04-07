@@ -123,6 +123,7 @@ int ftp_cmd_CPFR(ftp_env_t *env, const char* arg);
 int ftp_cmd_CPTO(ftp_env_t *env, const char* arg);
 int ftp_cmd_COPY(ftp_env_t *env, const char* arg);
 int ftp_cmd_MOVE(ftp_env_t *env, const char* arg);
+int ftp_cmd_STOP(ftp_env_t *env, const char* arg);
 int ftp_cmd_XQUOTA(ftp_env_t *env, const char* arg);
 int ftp_cmd_SELF(ftp_env_t *env, const char* arg);
 int ftp_cmd_SELFCHK(ftp_env_t *env, const char* arg);

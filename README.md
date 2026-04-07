@@ -30,6 +30,7 @@ These commands are implemented but were not previously documented here:
  - SITE CPFR <from> / SITE CPTO <to> - server-side copy (asynchronous).
  - SITE COPY <from> <to> - server-side copy (asynchronous).
  - SITE MOVE <from> <to> - server-side move (asynchronous).
+ - STOP / SITE STOP - stop the current asynchronous copy/move/delete operation.
  - SITE AUTHID <hex_authid> - set process AuthID (PS5 only).
 
 Note: the copy and move commands return immediately with `250 Copy started in

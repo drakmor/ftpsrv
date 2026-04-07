@@ -115,6 +115,7 @@ static ftp_command_t commands[] = {
   {"CPTO", ftp_cmd_CPTO},
   {"COPY", ftp_cmd_COPY},
   {"MOVE", ftp_cmd_MOVE},
+  {"STOP", ftp_cmd_STOP},
   {"XQUOTA", ftp_cmd_XQUOTA},
 
   // duplicates that ensure commands are 4 bytes long
