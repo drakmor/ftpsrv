@@ -65,18 +65,18 @@ along with this program; see the file COPYING. If not, see
  **/
 static void
 ftp_mode_string(mode_t mode, char *buf) {
-  char c, d;
-  int i, bit;
+  int c, d, i;
+  mode_t bit;
 
   buf[10] = 0;
   for(i=0; i<9; i++) {
-    bit = mode & (1<<i);
+    bit = mode & ((mode_t)1<<i);
     c = i%3;
-    if(!c && (mode & (1<<((d=i/3)+9)))) {
-      c = "tss"[(int)d];
+    if(!c && (mode & ((mode_t)1<<((d=i/3)+9)))) {
+      c = "tss"[d];
       if (!bit) c &= ~0x20;
-    } else c = bit ? "xwr"[(int)c] : '-';
-    buf[9-i] = c;
+    } else c = bit ? "xwr"[c] : '-';
+    buf[9-i] = (char)c;
   }
 
   if (S_ISDIR(mode)) c = 'd';
@@ -86,8 +86,20 @@ ftp_mode_string(mode_t mode, char *buf) {
   else if (S_ISFIFO(mode)) c = 'p';
   else if (S_ISSOCK(mode)) c = 's';
   else c = '-';
-  *buf = c;
+  *buf = (char)c;
 }
+
+
+static int
+ftp_set_stat_size(struct stat *st, size_t size) {
+  if((uint64_t)size > (uint64_t)INT64_MAX) {
+    errno = EFBIG;
+    return -1;
+  }
+  st->st_size = (off_t)size;
+  return 0;
+}
+
 
 /**
  * Normalize a path by resolving '.', '..', and redundant slashes.
@@ -599,7 +611,7 @@ ftp_perror(ftp_env_t *env) {
 static int
 ftp_errno_is_timeout(int e) {
   if(e == EAGAIN
-#ifdef EWOULDBLOCK
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
      || e == EWOULDBLOCK
 #endif
 #ifdef ETIMEDOUT
@@ -944,6 +956,8 @@ ftp_cmd_CDUP(ftp_env_t *env, const char* arg) {
   char pathbuf[PATH_MAX];
   struct stat st;
 
+  (void)arg;
+
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), "..")) {
     return ftp_perror(env);
   }
@@ -967,13 +981,22 @@ ftp_cmd_CHMOD(ftp_env_t *env, const char* arg) {
   char pathbuf[PATH_MAX];
   mode_t mode = 0;
   char* ptr;
+  char* end;
+  unsigned long parsed_mode;
   struct stat lst;
 
   if(!arg[0] || !(ptr=strstr(arg, " "))) {
     return ftp_active_printf(env, "501 Usage: CHMOD <MODE> <PATH>\r\n");
   }
 
-  mode = strtol(arg, 0, 8);
+  errno = 0;
+  parsed_mode = strtoul(arg, &end, 8);
+  if(errno || end == arg || end != ptr ||
+     parsed_mode > 07777) {
+    return ftp_active_printf(env, "501 Usage: CHMOD <MODE> <PATH>\r\n");
+  }
+  mode = (mode_t)parsed_mode;
+
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), ptr+1)) {
     return ftp_perror(env);
   }
@@ -2426,8 +2449,8 @@ ftp_list_get_stat(ftp_env_t *env, int dir_fd, const char *dir_path,
       have_path = 1;
     }
     size_t elf_size = self_is_valid(pathbuf);
-    if(elf_size) {
-      statbuf->st_size = elf_size;
+    if(elf_size && ftp_set_stat_size(statbuf, elf_size) != 0) {
+      return -1;
     }
   }
 
@@ -2721,17 +2744,19 @@ ftp_cmd_LIST(ftp_env_t *env, const char *arg) {
       return err;
     }
 
-  int err_xfer = ftp_list_xfer_start(env, NULL, &x);
-  if(err_xfer) {
-    ftp_list_ctx_free(&ctx);
-    return err_xfer < 0 ? err_xfer : 0;
-  }
-
     if(env->self2elf && S_ISREG(st.st_mode)) {
       size_t elf_size = self_is_valid(ctx.dir_path);
-      if(elf_size) {
-        st.st_size = elf_size;
+      if(elf_size && ftp_set_stat_size(&st, elf_size) != 0) {
+        err = ftp_perror(env);
+        ftp_list_ctx_free(&ctx);
+        return err;
       }
+    }
+
+    int err_xfer = ftp_list_xfer_start(env, NULL, &x);
+    if(err_xfer) {
+      ftp_list_ctx_free(&ctx);
+      return err_xfer < 0 ? err_xfer : 0;
     }
 
     ftp_mode_string(st.st_mode, modebuf);
@@ -2994,6 +3019,7 @@ ftp_cmd_MKD(ftp_env_t *env, const char* arg) {
  **/
 int
 ftp_cmd_NOOP(ftp_env_t *env, const char* arg) {
+  (void)arg;
   return ftp_active_printf(env, "200 NOOP OK\r\n");
 }
 
@@ -3098,6 +3124,7 @@ ftp_cmd_EPRT(ftp_env_t *env, const char *arg) {
  **/
 int
 ftp_cmd_PWD(ftp_env_t *env, const char* arg) {
+  (void)arg;
   return ftp_active_printf(env, "257 \"%s\"\r\n", env->cwd);
 }
 
@@ -3107,6 +3134,7 @@ ftp_cmd_PWD(ftp_env_t *env, const char* arg) {
  **/
 int
 ftp_cmd_QUIT(ftp_env_t *env, const char* arg) {
+  (void)arg;
   ftp_active_printf(env, "221 Goodbye\r\n");
   return -1;
 }
@@ -5212,7 +5240,10 @@ ftp_cmd_SIZE(ftp_env_t *env, const char* arg) {
   }
 
   if(env->self2elf) {
-    st.st_size = self_get_elfsize(pathbuf);
+    size_t elf_size = self_get_elfsize(pathbuf);
+    if(elf_size && ftp_set_stat_size(&st, elf_size) != 0) {
+      return ftp_perror(env);
+    }
   }
 
   if(!st.st_size) {
@@ -5445,6 +5476,7 @@ ftp_cmd_APPE(ftp_env_t *env, const char* arg) {
  **/
 int
 ftp_cmd_SYST(ftp_env_t *env, const char* arg) {
+  (void)arg;
   return ftp_active_printf(env, "215 UNIX Type: L8\r\n");
 }
 
@@ -5483,6 +5515,7 @@ ftp_cmd_TYPE(ftp_env_t *env, const char* arg) {
  **/
 int
 ftp_cmd_USER(ftp_env_t *env, const char* arg) {
+  (void)arg;
   return ftp_active_printf(env, "230 User logged in\r\n");
 }
 
@@ -5803,6 +5836,8 @@ ftp_cmd_STOP(ftp_env_t *env, const char *arg) {
  **/
 int
 ftp_cmd_KILL(ftp_env_t *env, const char* arg) {
+  (void)env;
+  (void)arg;
   FTP_LOG_PUTS("Server killed");
   exit(EXIT_SUCCESS);
   return -1;
@@ -5815,6 +5850,7 @@ ftp_cmd_KILL(ftp_env_t *env, const char* arg) {
  **/
 int
 ftp_cmd_SELF(ftp_env_t *env, const char* arg) {
+  (void)arg;
   env->self2elf = !env->self2elf;
 
   if(env->self2elf) {
@@ -5852,6 +5888,7 @@ ftp_cmd_SELFCHK(ftp_env_t *env, const char *arg) {
  **/
 int
 ftp_cmd_unavailable(ftp_env_t *env, const char* arg) {
+  (void)arg;
   return ftp_active_printf(env, "502 Command not implemented\r\n");
 }
 
@@ -5861,6 +5898,7 @@ ftp_cmd_unavailable(ftp_env_t *env, const char* arg) {
  **/
 int
 ftp_cmd_unknown(ftp_env_t *env, const char* arg) {
+  (void)arg;
   return ftp_active_printf(env, "502 Command not recognized\r\n");
 }
 
