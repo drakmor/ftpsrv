@@ -37,27 +37,71 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 /**
+ * Convert an ELF/SELF file range to safe I/O arguments.
+ **/
+static int
+self_io_range(uint64_t off, uint64_t len, off_t *off_out, size_t *len_out,
+              uint64_t *end_out) {
+  uint64_t max = (uint64_t)INT64_MAX;
+
+  if(len > (uint64_t)SIZE_MAX || off > max || len > max - off) {
+    errno = EFBIG;
+    return -1;
+  }
+  if(off_out) {
+    *off_out = (off_t)off;
+  }
+  if(len_out) {
+    *len_out = (size_t)len;
+  }
+  if(end_out) {
+    *end_out = off + len;
+  }
+  return 0;
+}
+
+
+static int
+self_u64_add_to_off(uint64_t off, uint64_t add, off_t *out) {
+  uint64_t max = (uint64_t)INT64_MAX;
+
+  if(off > max || add > max - off) {
+    errno = EFBIG;
+    return -1;
+  }
+  *out = (off_t)(off + add);
+  return 0;
+}
+
+
+/**
  * Decrypt and copy an ELF segment.
  **/
 static int
 decrypt_segment(int self_fd, int elf_fd, const Elf64_Phdr* phdr, size_t ind) {
   uint8_t* data = MAP_FAILED;
+  off_t dst_off;
+  size_t size;
   int err = 0;
+
+  if(self_io_range(phdr->p_offset, phdr->p_filesz, &dst_off, &size, 0)) {
+    return -1;
+  }
 
   pthread_mutex_lock(&g_mutex);
 
   if((data=self_map_segment(self_fd, phdr, ind)) == MAP_FAILED) {
     err = -1;
 
-  } else if(mlock(data, phdr->p_filesz)) {
+  } else if(mlock(data, size)) {
     err = -1;
 
-  } else if(io_pwrite(elf_fd, data, phdr->p_filesz, phdr->p_offset)) {
+  } else if(io_pwrite(elf_fd, data, size, dst_off)) {
     err = -1;
   }
 
   if(data != MAP_FAILED) {
-    munmap(data, phdr->p_filesz);
+    munmap(data, size);
   }
 
   pthread_mutex_unlock(&g_mutex);
@@ -70,9 +114,18 @@ decrypt_segment(int self_fd, int elf_fd, const Elf64_Phdr* phdr, size_t ind) {
  * Copy a plaintext ELF segment.
  **/
 static int
-copy_segment(int from_fd, off_t from_start, int to_fd, off_t to_start,
-             size_t size) {
-  return io_pcopy(from_fd, to_fd, from_start, to_start, size);
+copy_segment(int from_fd, uint64_t from_start, int to_fd, uint64_t to_start,
+             uint64_t len) {
+  off_t from_off;
+  off_t to_off;
+  size_t size;
+
+  if(self_io_range(from_start, len, &from_off, &size, 0) ||
+     self_io_range(to_start, len, &to_off, 0, 0)) {
+    return -1;
+  }
+
+  return io_pcopy(from_fd, to_fd, from_off, to_off, size);
 }
 
 
@@ -95,7 +148,11 @@ sha256sum(int fd, uint8_t hash[SHA256_BLOCK_SIZE]) {
     if((n=pread(fd, buf, sizeof(buf), off)) < 0) {
       return -1;
     }
-    sha256_update(&sha256, buf, n);
+    if(n == 0) {
+      errno = EIO;
+      return -1;
+    }
+    sha256_update(&sha256, buf, (size_t)n);
     off += n;
   }
   sha256_final(&sha256, hash);
@@ -111,13 +168,22 @@ static int
 zeropad(int fd, off_t off, off_t len) {
   struct stat st;
   void *buf;
+  off_t end;
   size_t n;
+
+  if(off < 0 || len < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if(self_u64_add_to_off((uint64_t)off, (uint64_t)len, &end)) {
+    return -1;
+  }
 
   if(fstat(fd, &st)) {
     return -1;
   }
 
-  if(st.st_size >= off+len) {
+  if(st.st_size >= end) {
     return 0;
   }
 
@@ -125,15 +191,14 @@ zeropad(int fd, off_t off, off_t len) {
     return -1;
   }
 
-  for(off_t i=st.st_size; i<off+len; i+=IO_COPY_BUFSIZE) {
-    n = IO_COPY_BUFSIZE;
-    if(i+n > off+len) {
-      n = off+len-i;
-    }
+  for(off_t i=st.st_size; i<end;) {
+    off_t remaining = end - i;
+    n = remaining > (off_t)IO_COPY_BUFSIZE ? IO_COPY_BUFSIZE : (size_t)remaining;
     if(io_pwrite(fd, buf, n, i)) {
       free(buf);
       return -1;
     }
+    i += (off_t)n;
   }
 
   free(buf);
@@ -147,6 +212,8 @@ self_get_elfsize_fd(int fd) {
   Elf64_Ehdr ehdr;
   Elf64_Phdr phdr;
   off_t elf_off;
+  off_t phdr_off;
+  uint64_t segment_end;
   size_t size = 0;
 
   if(io_nread(fd, &head, sizeof(head))) {
@@ -157,11 +224,14 @@ self_get_elfsize_fd(int fd) {
     return 0;
   }
 
-  if(lseek(fd, head.num_entries * sizeof(self_entry_t), SEEK_CUR) < 0) {
+  if(lseek(fd, (off_t)head.num_entries * (off_t)sizeof(self_entry_t),
+           SEEK_CUR) < 0) {
     return 0;
   }
 
-  elf_off = lseek(fd, 0, SEEK_CUR);
+  if((elf_off=lseek(fd, 0, SEEK_CUR)) < 0) {
+    return 0;
+  }
   if(io_nread(fd, &ehdr, sizeof(ehdr))) {
     return 0;
   }
@@ -171,7 +241,8 @@ self_get_elfsize_fd(int fd) {
     return 0;
   }
 
-  if(lseek(fd, elf_off + ehdr.e_phoff, SEEK_SET) < 0) {
+  if(self_u64_add_to_off((uint64_t)elf_off, ehdr.e_phoff, &phdr_off) ||
+     lseek(fd, phdr_off, SEEK_SET) < 0) {
     return 0;
   }
 
@@ -179,8 +250,15 @@ self_get_elfsize_fd(int fd) {
     if(io_nread(fd, &phdr, sizeof(phdr))) {
       return 0;
     }
-    if(phdr.p_offset + phdr.p_filesz > size) {
-      size = phdr.p_offset + phdr.p_filesz;
+    if(self_io_range(phdr.p_offset, phdr.p_filesz, 0, 0, &segment_end)) {
+      return 0;
+    }
+    if(segment_end > (uint64_t)SIZE_MAX) {
+      errno = EFBIG;
+      return 0;
+    }
+    if((size_t)segment_end > size) {
+      size = (size_t)segment_end;
     }
   }
 
@@ -215,11 +293,16 @@ self_extract_elf_ex(int self_fd, int elf_fd, int verify) {
   Elf64_Phdr phdr;
   size_t elf_size;
   off_t elf_off;
+  off_t phdr_off;
   off_t off;
 
   // Ensure wholes in the ELF file are all zeroed out
   elf_size = self_get_elfsize_fd(self_fd);
-  if(zeropad(elf_fd, 0, elf_size)) {
+  if(elf_size > (size_t)INT64_MAX) {
+    errno = EFBIG;
+    return -1;
+  }
+  if(zeropad(elf_fd, 0, (off_t)elf_size)) {
     return -1;
   }
   lseek(self_fd, 0, SEEK_SET);
@@ -271,7 +354,8 @@ self_extract_elf_ex(int self_fd, int elf_fd, int verify) {
 #endif
 
   // Skip ahead to the ELF program headers
-  if(lseek(self_fd, elf_off + ehdr.e_phoff, SEEK_SET) < 0) {
+  if(self_u64_add_to_off((uint64_t)elf_off, ehdr.e_phoff, &phdr_off) ||
+     lseek(self_fd, phdr_off, SEEK_SET) < 0) {
     free(entries);
     return -1;
   }
@@ -283,7 +367,6 @@ self_extract_elf_ex(int self_fd, int elf_fd, int verify) {
   }
 
   // Enumerate ELF program headers
-  elf_size = ehdr.e_phoff + ehdr.e_phnum * sizeof(phdr);
   for(int i=0; i<ehdr.e_phnum; i++) {
     if(io_nread(self_fd, &phdr, sizeof(phdr))) {
       free(entries);
@@ -300,8 +383,8 @@ self_extract_elf_ex(int self_fd, int elf_fd, int verify) {
 
     // PT_SCE_VERSION segment is appended at the end of the SELF file
     if(phdr.p_type == 0x6fffff01) {
-      if(copy_segment(self_fd, head.file_size, elf_fd, phdr.p_offset,
-                      phdr.p_filesz)) {
+      if(copy_segment(self_fd, head.file_size, elf_fd,
+                      phdr.p_offset, phdr.p_filesz)) {
 #if 0 // Some FSELFs are missing the version data, ignore error
 	free(entries);
 	return -1;
@@ -325,12 +408,12 @@ self_extract_elf_ex(int self_fd, int elf_fd, int verify) {
 
     // Decrypt and/or copy the segment
     if(entry->props.is_encrypted || entry->props.is_compressed) {
-      if(decrypt_segment(self_fd, elf_fd, &phdr, i)) {
+      if(decrypt_segment(self_fd, elf_fd, &phdr, (size_t)i)) {
         free(entries);
         return -1;
       }
-    } else if(copy_segment(self_fd, entry->offset, elf_fd, phdr.p_offset,
-                           phdr.p_filesz)) {
+    } else if(copy_segment(self_fd, entry->offset, elf_fd,
+                           phdr.p_offset, phdr.p_filesz)) {
       free(entries);
       return -1;
     }
