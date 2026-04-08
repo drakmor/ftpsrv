@@ -23,6 +23,9 @@ along with this program; see the file COPYING. If not, see
 
 void*
 self_map_segment(int fd, const Elf64_Phdr *phdr, size_t ind) {
+  (void)fd;
+  (void)phdr;
+  (void)ind;
   errno = ENOSYS;
   return MAP_FAILED;
 }
