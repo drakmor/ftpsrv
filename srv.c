@@ -153,7 +153,7 @@ ftp_reader_fill(ftp_reader_t *reader) {
 
   if(len <= 0) {
     if(len < 0 && (errno == EAGAIN
-#ifdef EWOULDBLOCK
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
                    || errno == EWOULDBLOCK
 #endif
 #ifdef ETIMEDOUT
@@ -176,8 +176,8 @@ ftp_reader_fill(ftp_reader_t *reader) {
  **/
 static char*
 ftp_readline(ftp_reader_t *reader) {
-  int bufsize = 1024;
-  int position = 0;
+  size_t bufsize = 1024;
+  size_t position = 0;
   int line_ready = 0;
   int overflow = 0;
   char *buffer_backup;

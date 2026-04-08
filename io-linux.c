@@ -44,9 +44,8 @@ io_sendfile(int in_fd, int out_fd, off_t offset, size_t n) {
       return -1;
     }
 
-    copied += r;
+    copied += (size_t)r;
   }
 
   return 0;
 }
-

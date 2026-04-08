@@ -94,7 +94,7 @@ int
 io_ncopy(int fd_in, int fd_out, size_t size) {
   size_t copied = 0;
   void* buf;
-  ssize_t n;
+  size_t n;
 
   if(!(buf=malloc(IO_COPY_BUFSIZE))) {
     return -1;
@@ -183,7 +183,7 @@ int
 io_pcopy(int fd_in, int fd_out, off_t off_in, off_t off_out, size_t size) {
   size_t copied = 0;
   void* buf;
-  ssize_t n;
+  size_t n;
 
   if(!(buf=malloc(IO_COPY_BUFSIZE))) {
     return -1;
@@ -204,8 +204,8 @@ io_pcopy(int fd_in, int fd_out, off_t off_in, off_t off_out, size_t size) {
       return -1;
     }
 
-    off_out += n;
-    off_in += n;
+    off_out += (off_t)n;
+    off_in += (off_t)n;
     copied += n;
   }
 
@@ -219,7 +219,7 @@ io_pcopy(int fd_in, int fd_out, off_t off_in, off_t off_out, size_t size) {
 int
 io_ncopy_buf(int fd_in, int fd_out, size_t size, void* buf, size_t bufsize) {
   size_t copied = 0;
-  ssize_t n;
+  size_t n;
 
   if(!buf || !bufsize) {
     errno = EINVAL;
@@ -228,18 +228,18 @@ io_ncopy_buf(int fd_in, int fd_out, size_t size, void* buf, size_t bufsize) {
 
   while(copied < size) {
     n = size - copied;
-    if(n > (ssize_t)bufsize) {
-      n = (ssize_t)bufsize;
+    if(n > bufsize) {
+      n = bufsize;
     }
 
-    if(io_nread(fd_in, buf, (size_t)n)) {
+    if(io_nread(fd_in, buf, n)) {
       return -1;
     }
-    if(io_nwrite(fd_out, buf, (size_t)n)) {
+    if(io_nwrite(fd_out, buf, n)) {
       return -1;
     }
 
-    copied += (size_t)n;
+    copied += n;
   }
 
   return 0;
