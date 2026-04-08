@@ -305,7 +305,9 @@ self_extract_elf_ex(int self_fd, int elf_fd, int verify) {
   if(zeropad(elf_fd, 0, (off_t)elf_size)) {
     return -1;
   }
-  lseek(self_fd, 0, SEEK_SET);
+  if(lseek(self_fd, 0, SEEK_SET) < 0) {
+    return -1;
+  }
 
   // Read the SELF header
   if(io_nread(self_fd, &head, sizeof(head))) {

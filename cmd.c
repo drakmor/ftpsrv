@@ -3029,21 +3029,29 @@ ftp_cmd_NOOP(ftp_env_t *env, const char* arg) {
  **/
 int
 ftp_cmd_PORT(ftp_env_t *env, const char* arg) {
-  uint8_t addr[6];
+  unsigned int addr[6];
   struct in_addr in_addr;
   uint32_t s_addr_host;
   uint16_t port_host;
+  char tail;
   int ret = 0;
 
-  if(sscanf(arg, "%hhu,%hhu,%hhu,%hhu,%hhu,%hhu",
-	    addr, addr+1, addr+2, addr+3, addr+4, addr+5) != 6) {
+  if(sscanf(arg, "%3u,%3u,%3u,%3u,%3u,%3u%c",
+            addr, addr+1, addr+2, addr+3, addr+4, addr+5, &tail) != 6) {
     return ftp_active_printf(env, "501 Usage: PORT <addr>\r\n");
   }
+  for(int i=0; i<6; i++) {
+    if(addr[i] > 255) {
+      return ftp_active_printf(env, "501 Usage: PORT <addr>\r\n");
+    }
+  }
 
-  s_addr_host = ((uint32_t)addr[0] << 24) | ((uint32_t)addr[1] << 16) |
-                ((uint32_t)addr[2] << 8) | (uint32_t)addr[3];
+  s_addr_host = ((uint32_t)addr[0] << 24) |
+                ((uint32_t)addr[1] << 16) |
+                ((uint32_t)addr[2] << 8) |
+                (uint32_t)addr[3];
   in_addr.s_addr = htonl(s_addr_host);
-  port_host = (uint16_t)(((uint16_t)addr[4] << 8) | (uint16_t)addr[5]);
+  port_host = (uint16_t)((addr[4] << 8) | addr[5]);
 
   ret = ftp_setup_active_data(env, in_addr, port_host,
                               "500 Illegal PORT command");
@@ -5866,12 +5874,10 @@ ftp_cmd_SELF(ftp_env_t *env, const char* arg) {
 int
 ftp_cmd_SELFCHK(ftp_env_t *env, const char *arg) {
   if(arg[0]) {
-    char *end = NULL;
-    long val = strtol(arg, &end, 10);
-    if(end == arg || (*end && *end != ' ')) {
+    if(arg[1] || (arg[0] != '0' && arg[0] != '1')) {
       return ftp_active_printf(env, "501 Usage: SCHK <0|1>\r\n");
     }
-    env->self_verify = val ? 1 : 0;
+    env->self_verify = arg[0] == '1';
   } else {
     env->self_verify = !env->self_verify;
   }
