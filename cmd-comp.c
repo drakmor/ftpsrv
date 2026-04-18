@@ -165,12 +165,6 @@ ftp_cmd_COMP(ftp_env_t *env, const char* arg) {
   if(!S_ISREG(st.st_mode)) {
     return ftp_active_printf(env, "550 Not a regular file\r\n");
   }
-  if(flag == SCE_KERNEL_SET_COMPRESS_FILE &&
-     (st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) {
-    if(chmod(pathbuf, st.st_mode & ~(S_IWUSR | S_IWGRP | S_IWOTH)) != 0) {
-      return ftp_perror(env);
-    }
-  }
 
   fd = open(pathbuf, oflags);
   if(fd < 0) {
@@ -181,6 +175,13 @@ ftp_cmd_COMP(ftp_env_t *env, const char* arg) {
     close(fd);
     return ftp_active_printf(env,
                              "550 File does not have PFS compression magic\r\n");
+  }
+  if(flag == SCE_KERNEL_SET_COMPRESS_FILE &&
+     (st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) {
+    if(chmod(pathbuf, st.st_mode & ~(S_IWUSR | S_IWGRP | S_IWOTH)) != 0) {
+      close(fd);
+      return ftp_perror(env);
+    }
   }
 
   ret = sceKernelSetCompressionAttribute(fd, flag);
