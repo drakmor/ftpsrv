@@ -14,9 +14,7 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
-#include <fcntl.h>
 #include <limits.h>
-#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -90,10 +88,10 @@ ftp_cmd_MTRW(ftp_env_t *env, const char* arg) {
   }
 
   return ftp_active_printf(env,
-			   "200- /preinst remounted\r\n"
-			   "200- /preinst2 remounted\r\n"
-			   "200- /system remounted\r\n"
-			   "200 /system_ex remounted\r\n");
+                           "200- /preinst remounted\r\n"
+                           "200- /preinst2 remounted\r\n"
+                           "200- /system remounted\r\n"
+                           "200 /system_ex remounted\r\n");
 }
 
 /**

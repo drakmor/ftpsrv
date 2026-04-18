@@ -18,9 +18,9 @@ along with this program; see the file COPYING. If not, see
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <unistd.h>
 
 #include <sys/_iovec.h>
