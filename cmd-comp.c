@@ -159,9 +159,6 @@ ftp_cmd_COMP(ftp_env_t *env, const char* arg) {
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), path) != 0) {
     return ftp_perror(env);
   }
-  if(strncmp(pathbuf, "/data/", 6) != 0) {
-    return ftp_active_printf(env, "550 COMP only supports files in /data\r\n");
-  }
   if(lstat(pathbuf, &st) != 0) {
     return ftp_perror(env);
   }
