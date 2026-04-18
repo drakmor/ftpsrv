@@ -60,6 +60,37 @@ along with this program; see the file COPYING. If not, see
 
 // #define IO_USE_SENDFILE  // Disabled. Speed x2 down ?!
 
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+static int
+ftp_cmd_RETR_fd_aio(ftp_env_t *env, int fd, off_t off, size_t remaining);
+
+static void
+ftp_free_owned_buffers(void *buffers[], const int owned[], int count) {
+  int i;
+
+  for(i=0; i<count; i++) {
+    if(owned[i] && buffers[i]) {
+      free(buffers[i]);
+    }
+  }
+}
+
+static int
+ftp_aio_find_reusable_slot(io_aio_slot_t slots[], int count) {
+  int i;
+
+  for(i=0; i<count; i++) {
+    if(!slots[i].in_flight) {
+      slots[i].ready = 0;
+      slots[i].result_len = 0;
+      return i;
+    }
+  }
+
+  return -1;
+}
+#endif
+
 
 /**
  * Create a string representation of a file mode.
@@ -3230,6 +3261,9 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
       goto out;
     }
   } else if(remaining) {
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+    return ftp_cmd_RETR_fd_aio(env, fd, off, remaining);
+#else
     if(remaining < 1460) {  // Typical MSS size
 #ifdef TCP_NODELAY
       (void)setsockopt(env->data_fd, IPPROTO_TCP, TCP_NODELAY,  &(int){1},
@@ -3262,6 +3296,7 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
       ftp_data_close(env);
       goto out;
     }
+#endif
 #endif
   }
 
@@ -3318,6 +3353,281 @@ ftp_cmd_RETR_self2elf(ftp_env_t *env, int fd) {
 
   return err;
 }
+
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+static int
+ftp_cmd_RETR_fd_aio(ftp_env_t *env, int fd, off_t off, size_t remaining) {
+  void *buffers[IO_AIO_READ_QUEUE_DEPTH] = {0};
+  int buffer_owned[IO_AIO_READ_QUEUE_DEPTH] = {0};
+  io_aio_slot_t slots[IO_AIO_READ_QUEUE_DEPTH];
+  size_t bufsize = env->xfer_buf_size;
+  int head = 0;
+  int queued = 0;
+  off_t next_off = off;
+  ssize_t len = 0;
+  int err = 0;
+  int i;
+
+  memset(slots, 0, sizeof(slots));
+
+  if(io_aio_require() != 0) {
+    err = ftp_perror(env);
+    (void)ftp_data_close(env);
+    kstuff_autopause_active_end();
+    return err;
+  }
+
+  if(!bufsize || bufsize < IO_AIO_CHUNK_SIZE) {
+    bufsize = IO_AIO_CHUNK_SIZE;
+  }
+
+  if(env->xfer_buf && env->xfer_buf_size >= bufsize) {
+    buffers[0] = env->xfer_buf;
+  } else {
+    buffers[0] = malloc(bufsize);
+    buffer_owned[0] = 1;
+  }
+
+  if(!buffers[0]) {
+    err = ftp_perror(env);
+    (void)ftp_data_close(env);
+    kstuff_autopause_active_end();
+    return err;
+  }
+
+  for(i=1; i<IO_AIO_READ_QUEUE_DEPTH; i++) {
+    buffers[i] = malloc(bufsize);
+    buffer_owned[i] = 1;
+    if(!buffers[i]) {
+      err = ftp_perror(env);
+      (void)ftp_data_close(env);
+      ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_READ_QUEUE_DEPTH);
+      kstuff_autopause_active_end();
+      return err;
+    }
+  }
+
+  while(queued < IO_AIO_READ_QUEUE_DEPTH && remaining > 0) {
+    size_t chunk = remaining < bufsize ? remaining : bufsize;
+    int slot_idx = (head + queued) % IO_AIO_READ_QUEUE_DEPTH;
+
+    if(io_aio_read_submit(&slots[slot_idx], fd, buffers[slot_idx], chunk,
+                          next_off) != 0) {
+      err = ftp_perror(env);
+      (void)ftp_data_close(env);
+      ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_READ_QUEUE_DEPTH);
+      kstuff_autopause_active_end();
+      return err;
+    }
+
+    next_off += (off_t)chunk;
+    remaining -= chunk;
+    queued++;
+  }
+
+  while(queued > 0) {
+    io_aio_slot_t *slot = &slots[head];
+
+    if(slot->ready) {
+      len = slot->result_len;
+      if(len <= 0 || io_nwrite(env->data_fd, buffers[head], (size_t)len)) {
+        err = ftp_data_xfer_error_reply(env);
+        break;
+      }
+
+      slot->ready = 0;
+      slot->result_len = 0;
+      queued--;
+      head = (head + 1) % IO_AIO_READ_QUEUE_DEPTH;
+
+      if(remaining > 0) {
+        size_t chunk = remaining < bufsize ? remaining : bufsize;
+        int slot_idx = (head + queued) % IO_AIO_READ_QUEUE_DEPTH;
+
+        if(io_aio_read_submit(&slots[slot_idx], fd, buffers[slot_idx], chunk,
+                              next_off) != 0) {
+          err = ftp_perror(env);
+          break;
+        }
+
+        next_off += (off_t)chunk;
+        remaining -= chunk;
+        queued++;
+      }
+
+      continue;
+    }
+
+    if(!slot->in_flight) {
+      errno = EIO;
+      err = ftp_perror(env);
+      break;
+    }
+
+    i = io_aio_wait_any(slots, IO_AIO_READ_QUEUE_DEPTH);
+    if(i < 0) {
+      err = ftp_perror(env);
+      break;
+    }
+    if(i == 0) {
+      errno = EIO;
+      err = ftp_perror(env);
+      break;
+    }
+  }
+
+  if(io_aio_drain(slots, IO_AIO_READ_QUEUE_DEPTH) != 0 && !err) {
+    err = ftp_perror(env);
+  }
+
+  if(err) {
+    (void)ftp_data_close(env);
+    ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_READ_QUEUE_DEPTH);
+    kstuff_autopause_active_end();
+    return err;
+  }
+
+  if(ftp_data_close(env)) {
+    err = ftp_perror(env);
+  } else {
+    err = ftp_active_printf(env, "226 Transfer completed\r\n");
+  }
+
+  ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_READ_QUEUE_DEPTH);
+  kstuff_autopause_active_end();
+  return err;
+}
+
+static int
+ftp_cmd_STOR_binary_aio(ftp_env_t *env, int fd, void *readbuf, size_t bufsize,
+                        int free_buf, off_t off) {
+  void *buffers[IO_AIO_WRITE_QUEUE_DEPTH] = {0};
+  int buffer_owned[IO_AIO_WRITE_QUEUE_DEPTH] = {0};
+  io_aio_slot_t slots[IO_AIO_WRITE_QUEUE_DEPTH];
+  size_t chunk_size = bufsize;
+  int slot_idx;
+  ssize_t len = 0;
+  int err = 0;
+  int i;
+
+  memset(slots, 0, sizeof(slots));
+
+  if(io_aio_require() != 0) {
+    err = ftp_perror(env);
+    ftp_data_close(env);
+    close(fd);
+    if(free_buf && readbuf) {
+      free(readbuf);
+    }
+    kstuff_autopause_active_end();
+    return err;
+  }
+
+  if(chunk_size < IO_AIO_CHUNK_SIZE) {
+    chunk_size = IO_AIO_CHUNK_SIZE;
+  }
+
+  if(readbuf && bufsize >= chunk_size) {
+    buffers[0] = readbuf;
+    buffer_owned[0] = free_buf;
+  } else {
+    if(free_buf && readbuf) {
+      free(readbuf);
+      readbuf = NULL;
+      free_buf = 0;
+    }
+    buffers[0] = malloc(chunk_size);
+    buffer_owned[0] = 1;
+  }
+
+  if(!buffers[0]) {
+    err = ftp_perror(env);
+    ftp_data_close(env);
+    close(fd);
+    kstuff_autopause_active_end();
+    return err;
+  }
+
+  for(i=1; i<IO_AIO_WRITE_QUEUE_DEPTH; i++) {
+    buffers[i] = malloc(chunk_size);
+    buffer_owned[i] = 1;
+    if(!buffers[i]) {
+      err = ftp_perror(env);
+      ftp_data_close(env);
+      close(fd);
+      ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_WRITE_QUEUE_DEPTH);
+      kstuff_autopause_active_end();
+      return err;
+    }
+  }
+
+  for(;;) {
+    slot_idx = ftp_aio_find_reusable_slot(slots, IO_AIO_WRITE_QUEUE_DEPTH);
+    if(slot_idx < 0) {
+      i = io_aio_wait_any(slots, IO_AIO_WRITE_QUEUE_DEPTH);
+      if(i < 0) {
+        err = ftp_perror(env);
+        break;
+      }
+      if(i == 0) {
+        errno = EIO;
+        err = ftp_perror(env);
+        break;
+      }
+      continue;
+    }
+
+    len = ftp_data_read(env, buffers[slot_idx], chunk_size);
+    if(len < 0) {
+      err = ftp_data_xfer_error_reply(env);
+      break;
+    }
+    if(len == 0) {
+      break;
+    }
+
+    if(io_aio_write_submit(&slots[slot_idx], fd, buffers[slot_idx], (size_t)len,
+                           off) != 0) {
+      err = ftp_perror(env);
+      break;
+    }
+    off += len;
+  }
+
+  if(io_aio_drain(slots, IO_AIO_WRITE_QUEUE_DEPTH) != 0 && !err) {
+    err = ftp_perror(env);
+  }
+
+  if(err) {
+    ftp_data_close(env);
+    close(fd);
+    ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_WRITE_QUEUE_DEPTH);
+    kstuff_autopause_active_end();
+    return err;
+  }
+
+  if(ftruncate(fd, off)) {
+    err = ftp_perror(env);
+    ftp_data_close(env);
+    close(fd);
+    ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_WRITE_QUEUE_DEPTH);
+    kstuff_autopause_active_end();
+    return err;
+  }
+
+  close(fd);
+  if(ftp_data_close(env)) {
+    err = ftp_perror(env);
+    ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_WRITE_QUEUE_DEPTH);
+    kstuff_autopause_active_end();
+    return err;
+  }
+
+  ftp_free_owned_buffers(buffers, buffer_owned, IO_AIO_WRITE_QUEUE_DEPTH);
+  kstuff_autopause_active_end();
+  return ftp_active_printf(env, "226 Data transfer complete\r\n");
+}
+#endif
 
 
 /**
@@ -4030,7 +4340,7 @@ static int
 ftp_copy_symlink(const char *src_path, const char *dst_path) {
   char linkbuf[PATH_MAX + 1];
   char tmp_path[PATH_MAX];
-  ssize_t len;
+  ssize_t len = 0;
   int fd;
 
   if(ftp_server_bg_op_cancelled()) {
@@ -5294,7 +5604,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
   int err = 0;
   int active = 0;
   int free_buf = 0;
-  ssize_t len;
+  ssize_t len = 0;
   struct stat st;
   int flags = O_WRONLY;
 #ifdef O_CLOEXEC
@@ -5385,8 +5695,14 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
   active = 1;
 
   if(!readbuf || !bufsize) {
-    readbuf = malloc(IO_COPY_BUFSIZE);
-    bufsize = IO_COPY_BUFSIZE;
+    size_t alloc_size = IO_COPY_BUFSIZE;
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+    if(env->type != 'A' && alloc_size < IO_AIO_CHUNK_SIZE) {
+      alloc_size = IO_AIO_CHUNK_SIZE;
+    }
+#endif
+    readbuf = malloc(alloc_size);
+    bufsize = alloc_size;
     free_buf = 1;
     if(!readbuf) {
       err = ftp_perror(env);
@@ -5407,6 +5723,9 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
       goto out;
     }
   } else {
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+    return ftp_cmd_STOR_binary_aio(env, fd, readbuf, bufsize, free_buf, off);
+#else
     while((len = ftp_data_read(env, readbuf, bufsize)) > 0) {
       if(io_nwrite(fd, readbuf, (size_t)len)) {
         err = ftp_perror(env);
@@ -5419,6 +5738,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
       }
       off += len;
     }
+#endif
   }
 
   if(env->type != 'A' && len < 0) {
