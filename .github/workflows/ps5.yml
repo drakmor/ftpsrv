@@ -36,12 +36,15 @@ jobs:
     - name: Build Payload
       run: |
         make -f Makefile.ps5 clean all
+        make -f Makefile.ps5-autopause all
 
     - name: Upload Payload
       uses: actions/upload-artifact@v4
       with:
         name: Payload
-        path: ftpsrv-ps5.elf
+        path: |
+          ftpsrv-ps5.elf
+          ftpsrv-ps5-autopause.elf
         if-no-files-found: error
 
   release:
@@ -63,4 +66,6 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: true
-          files: ftpsrv-ps5.elf
+          files: |
+            ftpsrv-ps5.elf
+            ftpsrv-ps5-autopause.elf

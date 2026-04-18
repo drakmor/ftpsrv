@@ -18,4 +18,6 @@ along with this program; see the file COPYING. If not, see
 
 #pragma once
 
+#define FTP_SERVE_BIND_FAILED (-2)
+
 int ftp_serve(uint16_t port, int notify_user);

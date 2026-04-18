@@ -24,13 +24,14 @@ along with this program; see the file COPYING. If not, see
 
 #include <ps5/kernel.h>
 
+#include "kstuff_autopause.h"
 #include "main-common.h"
 #include "srv.h"
 #include "log.h"
 
 
 /**
- * Fint the pid of a process with the given name.
+ * Find the pid of a process with the given name.
  **/
 static pid_t
 find_pid(const char* name) {
@@ -80,6 +81,7 @@ int
 main(int argc, char* argv[]) {
   uint16_t port = 2121;
   int notify_user = 1;
+  int rc;
   pid_t pid;
   int c;
 
@@ -122,8 +124,15 @@ main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
 
+#ifdef KSTUFF_AUTOPAUSE
+  kstuff_autopause_init();
+#endif
+
   while(1) {
-    ftp_serve(port, notify_user);
+    rc = ftp_serve(port, notify_user);
+    if(rc == FTP_SERVE_BIND_FAILED) {
+      return EXIT_FAILURE;
+    }
     notify_user = 0;
     sleep(3);
   }

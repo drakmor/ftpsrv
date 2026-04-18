@@ -29,6 +29,7 @@ along with this program; see the file COPYING. If not, see
 #include <ps5/kernel.h>
 
 #include "cmd.h"
+#include "kstuff_autopause.h"
 #include "self.h"
 
 
@@ -92,6 +93,7 @@ ftp_parse_authid(const char *arg, uint64_t *out) {
  **/
 int
 ftp_cmd_MTRW(ftp_env_t *env, const char* arg) {
+  int ret;
   struct iovec iov_preinst[] = {
     IOVEC_ENTRY("from"),      IOVEC_ENTRY("/dev/ssd0.preinst"),
     IOVEC_ENTRY("fspath"),    IOVEC_ENTRY("/preinst"),
@@ -120,20 +122,29 @@ ftp_cmd_MTRW(ftp_env_t *env, const char* arg) {
     IOVEC_ENTRY("ignoreacl"), IOVEC_ENTRY(NULL),
   };
 
+  kstuff_autopause_required_begin();
+
   if(nmount(iov_preinst, IOVEC_SIZE(iov_preinst), MNT_UPDATE)) {
-    return ftp_perror(env);
+    ret = ftp_perror(env);
+    goto out;
   }
   if(nmount(iov_sys, IOVEC_SIZE(iov_sys), MNT_UPDATE)) {
-    return ftp_perror(env);
+    ret = ftp_perror(env);
+    goto out;
   }
   if(nmount(iov_sysex, IOVEC_SIZE(iov_sysex), MNT_UPDATE)) {
-    return ftp_perror(env);
+    ret = ftp_perror(env);
+    goto out;
   }
 
-  return ftp_active_printf(env,
-			   "200- /preinst remounted\r\n"
-			   "200- /system remounted\r\n"
-			   "200 /system_ex remounted\r\n");
+  ret = ftp_active_printf(env,
+                          "200- /preinst remounted\r\n"
+                          "200- /system remounted\r\n"
+                          "200 /system_ex remounted\r\n");
+
+out:
+  kstuff_autopause_required_end();
+  return ret;
 }
 
 /**
@@ -143,20 +154,28 @@ int
 ftp_cmd_AUTHID(ftp_env_t *env, const char* arg) {
   uint64_t authid = 0;
   pid_t pid = getpid();
+  int ret;
 
   if(ftp_parse_authid(arg, &authid)) {
     return ftp_active_printf(env, "501 Usage: AUTHID <HEX_AUTHID>\r\n");
   }
 
+  kstuff_autopause_required_begin();
+
   if(kernel_set_ucred_authid(pid, authid)) {
     if(errno == 0) {
       errno = EPERM;
     }
-    return ftp_perror(env);
+    ret = ftp_perror(env);
+    goto out;
   }
 
-  return ftp_active_printf(env, "200 AuthID set to 0x%016" PRIx64 "\r\n",
-                           authid);
+  ret = ftp_active_printf(env, "200 AuthID set to 0x%016" PRIx64 "\r\n",
+                          authid);
+
+out:
+  kstuff_autopause_required_end();
+  return ret;
 }
 
 

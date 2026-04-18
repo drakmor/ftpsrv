@@ -1,4 +1,4 @@
-#   Copyright (C) 2025 John Törnblom
+#   Copyright (C) 2026 John Törnblom
 #
 # This file is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -23,14 +23,14 @@ else
     $(error PS5_PAYLOAD_SDK is undefined)
 endif
 
-ELF := ftpsrv-ps5.elf
+ELF := ftpsrv-ps5-autopause.elf
 ELF_STRIP := $(firstword $(wildcard $(PS5_PAYLOAD_SDK)/bin/prospero-llvm-strip) \
 	$(wildcard $(PS5_PAYLOAD_SDK)/bin/prospero-strip))
 
-VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)
+VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)-autopause
 
-CFLAGS := $(CFLAGS) -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -I. -O3 -DNDEBUG -march=znver2 -mtune=znver2 -flto
-SOURCE := srv.c cmd.c notify.c io.c self.c sha256.c
+CFLAGS := $(CFLAGS) -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -DKSTUFF_AUTOPAUSE -I. -O3 -DNDEBUG -march=znver2 -mtune=znver2 -flto
+SOURCE := srv.c cmd.c notify.c io.c self.c sha256.c kstuff_autopause.c
 SOURCE += main-prospero.c cmd-prospero.c self-prospero.c
 SOURCE += io-freebsd.c
 

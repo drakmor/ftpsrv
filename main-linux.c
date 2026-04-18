@@ -26,6 +26,7 @@ int
 main(int argc, char* argv[]) {
   uint16_t port = 2121;
   int notify_user = 1;
+  int rc;
   int c;
 
   while((c=getopt(argc, argv, "p:h")) != -1) {
@@ -50,7 +51,10 @@ main(int argc, char* argv[]) {
   signal(SIGPIPE, SIG_IGN);
 
   while(1) {
-    ftp_serve(port, notify_user);
+    rc = ftp_serve(port, notify_user);
+    if(rc == FTP_SERVE_BIND_FAILED) {
+      return 1;
+    }
     notify_user = 0;
     sleep(3);
   }

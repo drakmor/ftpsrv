@@ -41,6 +41,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "cmd.h"
 #include "io.h"
+#include "kstuff_autopause.h"
 #include "log.h"
 #include "notify.h"
 #include "self.h"
@@ -1428,6 +1429,7 @@ ftp_list_xfer_start(ftp_env_t *env, DIR *dir, ftp_xfer_buf_t *x) {
     return open_err;
   }
 
+  kstuff_autopause_active_begin();
   return 0;
 }
 
@@ -1453,6 +1455,7 @@ ftp_list_xfer_finish(ftp_env_t *env, DIR *dir, ftp_xfer_buf_t *x) {
   }
 
   ftp_xfer_buf_release(x);
+  kstuff_autopause_active_end();
 
   if(x->failed) {
     return 0;
@@ -3194,6 +3197,7 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
   struct stat st;
   size_t remaining;
   int err = 0;
+  int active = 0;
 
   if(env->type == 'A' && off != 0 && is_rest) {
     return ftp_active_printf(env, "504 REST not supported in ASCII mode\r\n");
@@ -3216,12 +3220,14 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
   if(open_err) {
     return open_err < 0 ? open_err : 0;
   }
+  kstuff_autopause_active_begin();
+  active = 1;
 
   if(env->type == 'A') {
     if(ftp_copy_ascii_out(env, fd)) {
       err = ftp_data_xfer_error_reply(env);
       ftp_data_close(env);
-      return err;
+      goto out;
     }
   } else if(remaining) {
     if(remaining < 1460) {  // Typical MSS size
@@ -3240,7 +3246,7 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
     if(io_sendfile(fd, env->data_fd, off, remaining)) {
       err = ftp_data_xfer_error_reply(env);
       ftp_data_close(env);
-      return err;
+      goto out;
     }
 #else
 
@@ -3249,21 +3255,28 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
                       env->xfer_buf_size)) {
         err = ftp_data_xfer_error_reply(env);
         ftp_data_close(env);
-        return err;
+        goto out;
       }
     } else if(io_ncopy(fd, env->data_fd, remaining)) {
       err = ftp_data_xfer_error_reply(env);
       ftp_data_close(env);
-      return err;
+      goto out;
     }
 #endif
   }
 
   if(ftp_data_close(env)) {
-    return ftp_perror(env);
+    err = ftp_perror(env);
+    goto out;
   }
 
-  return ftp_active_printf(env, "226 Transfer completed\r\n");
+  err = ftp_active_printf(env, "226 Transfer completed\r\n");
+
+out:
+  if(active) {
+    kstuff_autopause_active_end();
+  }
+  return err;
 }
 
 
@@ -3283,7 +3296,9 @@ ftp_cmd_RETR_self2elf(ftp_env_t *env, int fd) {
     fclose(tmpf);
     return -1;
   }
+  kstuff_autopause_required_begin();
   if(self_extract_elf_ex(fd, fileno(tmpf), env->self_verify)) {
+    kstuff_autopause_required_end();
     if(errno != EBADMSG) {
       err = ftp_perror(env);
       fclose(tmpf);
@@ -3293,6 +3308,8 @@ ftp_cmd_RETR_self2elf(ftp_env_t *env, int fd) {
       fclose(tmpf);
       return -1;
     }
+  } else {
+    kstuff_autopause_required_end();
   }
 
   rewind(tmpf);
@@ -5275,6 +5292,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
   void *readbuf = env->xfer_buf;
   size_t bufsize = env->xfer_buf_size;
   int err = 0;
+  int active = 0;
   int free_buf = 0;
   ssize_t len;
   struct stat st;
@@ -5363,6 +5381,8 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
     close(fd);
     return open_err < 0 ? open_err : 0;
   }
+  kstuff_autopause_active_begin();
+  active = 1;
 
   if(!readbuf || !bufsize) {
     readbuf = malloc(IO_COPY_BUFSIZE);
@@ -5372,7 +5392,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
       err = ftp_perror(env);
       ftp_data_close(env);
       close(fd);
-      return err;
+      goto out;
     }
   }
 
@@ -5384,7 +5404,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
         free(readbuf);
       }
       close(fd);
-      return err;
+      goto out;
     }
   } else {
     while((len = ftp_data_read(env, readbuf, bufsize)) > 0) {
@@ -5395,7 +5415,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
           free(readbuf);
         }
         close(fd);
-        return err;
+        goto out;
       }
       off += len;
     }
@@ -5408,7 +5428,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
       free(readbuf);
     }
     close(fd);
-    return err;
+    goto out;
   }
 
   if(free_buf) {
@@ -5419,15 +5439,22 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
     err = ftp_perror(env);
     ftp_data_close(env);
     close(fd);
-    return err;
+    goto out;
   }
 
   close(fd);
   if(ftp_data_close(env)) {
-    return ftp_perror(env);
+    err = ftp_perror(env);
+    goto out;
   }
 
-  return ftp_active_printf(env, "226 Data transfer complete\r\n");
+  err = ftp_active_printf(env, "226 Data transfer complete\r\n");
+
+out:
+  if(active) {
+    kstuff_autopause_active_end();
+  }
+  return err;
 }
 
 
