@@ -36,7 +36,11 @@ along with this program; see the file COPYING. If not, see
 #define IO_SOCK_CTRL_BUFSIZE (64 * 1024)
 #endif
 
-#if defined(__PROSPERO__) || defined(__ORBIS__)
+#if (defined(__PROSPERO__) || defined(__ORBIS__)) && defined(ENABLE_AIO) && ENABLE_AIO
+#define IO_USE_AIO 1
+#endif
+
+#if defined(IO_USE_AIO)
 #ifndef IO_AIO_READ_QUEUE_DEPTH
 #define IO_AIO_READ_QUEUE_DEPTH 8
 #endif
@@ -151,7 +155,7 @@ int io_pcopy(int fd_in, int fd_out, off_t off_in, off_t off_out, size_t n);
 int io_set_socket_opts(int fd, int is_data);
 
 
-#if defined(__PROSPERO__) || defined(__ORBIS__)
+#if defined(IO_USE_AIO)
 /**
  * Ensure kernel AIO is available for the current process.
  **/

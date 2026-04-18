@@ -16,6 +16,7 @@
 
 PS5_HOST ?= ps5
 PS5_PORT ?= 9021
+ENABLE_AIO ?= 0
 
 ifdef PS5_PAYLOAD_SDK
     include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
@@ -30,6 +31,9 @@ ELF_STRIP := $(firstword $(wildcard $(PS5_PAYLOAD_SDK)/bin/prospero-llvm-strip) 
 VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)
 
 CFLAGS := $(CFLAGS) -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -I. -O3 -DNDEBUG -march=znver2 -mtune=znver2 -flto
+ifneq ($(ENABLE_AIO),0)
+CFLAGS += -DENABLE_AIO=1
+endif
 SOURCE := srv.c cmd.c cmd-comp.c notify.c io.c self.c sha256.c
 SOURCE += main-prospero.c cmd-prospero.c self-prospero.c
 SOURCE += io-freebsd.c

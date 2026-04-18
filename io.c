@@ -35,7 +35,7 @@ along with this program; see the file COPYING. If not, see
 #define FTP_DATA_TIMEOUT_SEC 300
 #endif
 
-#if defined(__PROSPERO__) || defined(__ORBIS__)
+#if defined(IO_USE_AIO)
 #define SCE_OK 0
 #define SCE_KERNEL_AIO_PRIORITY_MID 2
 #define SCE_KERNEL_AIO_WAIT_OR 0x02

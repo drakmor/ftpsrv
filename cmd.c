@@ -60,7 +60,7 @@ along with this program; see the file COPYING. If not, see
 
 // #define IO_USE_SENDFILE  // Disabled. Speed x2 down ?!
 
-#if defined(__PROSPERO__) || defined(__ORBIS__)
+#if defined(IO_USE_AIO)
 static int
 ftp_cmd_RETR_fd_aio(ftp_env_t *env, int fd, off_t off, size_t remaining);
 
@@ -3261,7 +3261,7 @@ ftp_cmd_RETR_fd(ftp_env_t *env, int fd) {
       goto out;
     }
   } else if(remaining) {
-#if defined(__PROSPERO__) || defined(__ORBIS__)
+#if defined(IO_USE_AIO)
     return ftp_cmd_RETR_fd_aio(env, fd, off, remaining);
 #else
     if(remaining < 1460) {  // Typical MSS size
@@ -3354,7 +3354,7 @@ ftp_cmd_RETR_self2elf(ftp_env_t *env, int fd) {
   return err;
 }
 
-#if defined(__PROSPERO__) || defined(__ORBIS__)
+#if defined(IO_USE_AIO)
 static int
 ftp_cmd_RETR_fd_aio(ftp_env_t *env, int fd, off_t off, size_t remaining) {
   void *buffers[IO_AIO_READ_QUEUE_DEPTH] = {0};
@@ -5696,7 +5696,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
 
   if(!readbuf || !bufsize) {
     size_t alloc_size = IO_COPY_BUFSIZE;
-#if defined(__PROSPERO__) || defined(__ORBIS__)
+#if defined(IO_USE_AIO)
     if(env->type != 'A' && alloc_size < IO_AIO_CHUNK_SIZE) {
       alloc_size = IO_AIO_CHUNK_SIZE;
     }
@@ -5723,7 +5723,7 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
       goto out;
     }
   } else {
-#if defined(__PROSPERO__) || defined(__ORBIS__)
+#if defined(IO_USE_AIO)
     return ftp_cmd_STOR_binary_aio(env, fd, readbuf, bufsize, free_buf, off);
 #else
     while((len = ftp_data_read(env, readbuf, bufsize)) > 0) {
