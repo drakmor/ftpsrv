@@ -30,13 +30,20 @@ These commands are implemented but were not previously documented here:
  - SITE CPFR <from> / SITE CPTO <to> - server-side copy (asynchronous).
  - SITE COPY <from> <to> - server-side copy (asynchronous).
  - SITE MOVE <from> <to> - server-side move (asynchronous).
- - STOP / SITE STOP - stop the current asynchronous copy/move/delete operation.
+ - SITE LOWER <path> - recursively rename a file or directory tree to lowercase.
+ - SITE UPPER <path> - recursively rename a file or directory tree to uppercase.
+ - STOP / SITE STOP - stop the current copy/move/delete/case operation.
  - SITE AUTHID <hex_authid> - set process AuthID (PS5 only).
 
 Note: the copy and move commands return immediately with `250 Copy started in
 background` or `250 Move started in background`; errors during the background
-operation are not reported to the client. Only one asynchronous copy, move, or
-recursive delete operation can run on the server at a time.
+operation are not reported to the client. Only one copy, move, recursive
+delete, LOWER, or UPPER operation can run on the server at a time.
+
+The LOWER and UPPER commands also work without the SITE prefix. They rename the
+target path and every nested file, directory, and symlink name. Before changing
+anything, the server checks each directory for case-conversion name collisions
+such as `File.bin` and `file.bin`.
 
 Some clients (e.g. WinSCP) can be configured to use these extra commands
 for file management operations.

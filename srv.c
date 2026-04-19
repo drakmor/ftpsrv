@@ -119,6 +119,8 @@ static ftp_command_t commands[] = {
   {"CPTO", ftp_cmd_CPTO, 0},
   {"COPY", ftp_cmd_COPY, 0},
   {"MOVE", ftp_cmd_MOVE, 0},
+  {"LOWER", ftp_cmd_LOWER, 0},
+  {"UPPER", ftp_cmd_UPPER, 0},
   {"STOP", ftp_cmd_STOP, 0},
   {"XQUOTA", ftp_cmd_XQUOTA, 0},
 
