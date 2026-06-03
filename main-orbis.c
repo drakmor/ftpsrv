@@ -32,6 +32,7 @@ along with this program; see the file COPYING. If not, see
 /**
  * Fint the pid of a process with the given name.
  **/
+/*
 static pid_t
 find_pid(const char* name) {
   int mib[4] = {1, 14, 8, 0};
@@ -71,7 +72,7 @@ find_pid(const char* name) {
 
   return pid;
 }
-
+*/
 
 /**
  * Launch payload.
@@ -81,10 +82,10 @@ main(int argc, char* argv[]) {
   uint16_t port = 2121;
   int notify_user = 1;
   int rc;
-  pid_t pid;
+  // pid_t pid;
   int c;
 
-  syscall(SYS_thr_set_name, -1, "ftpsrv.elf");
+  // syscall(SYS_thr_set_name, -1, "ftpsrv.elf");
 
   while((c=getopt(argc, argv, "p:h")) != -1) {
     switch(c) {
@@ -105,6 +106,7 @@ main(int argc, char* argv[]) {
     }
   }
 
+  /*
   while((pid=find_pid("ftpsrv.elf")) > 0) {
     if(kill(pid, SIGKILL)) {
       FTP_LOG_PERROR("kill");
@@ -112,7 +114,7 @@ main(int argc, char* argv[]) {
     }
     sleep(1);
   }
-
+*/
   signal(SIGPIPE, SIG_IGN);
 
   FTP_LOG_PRINTF("FTP server was compiled at %s %s\n", __DATE__, __TIME__);
