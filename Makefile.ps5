@@ -34,7 +34,7 @@ CFLAGS := $(CFLAGS) -Wall -Werror -DVERSION_TAG=\"$(VERSION_TAG)\" -I. -O3 -DNDE
 ifneq ($(ENABLE_AIO),0)
 CFLAGS += -DENABLE_AIO=1
 endif
-SOURCE := srv.c cmd.c cmd-comp.c notify.c io.c self.c sha256.c
+SOURCE := srv.c cmd.c cmd-proc.c cmd-comp.c notify.c io.c self.c sha256.c
 SOURCE += main-prospero.c cmd-prospero.c self-prospero.c
 SOURCE += io-freebsd.c
 

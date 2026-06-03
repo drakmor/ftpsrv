@@ -35,6 +35,14 @@ These commands are implemented but were not previously documented here:
  - STOP / SITE STOP - stop the current copy/move/delete/case operation.
  - SITE AUTHID <hex_authid> - set process AuthID (PS5 only).
 
+On PS5, the server also exposes a virtual `/proc` directory in the root listing.
+`LIST /proc` shows process files with process start times and names formatted
+as `<pid>_<title-id>_<command>`, plus `_all_` for the full process table.
+`RETR /proc/_all_` shows the current process table, and `RETR /proc/<pid>` or
+`RETR /proc/<pid>_<title-id>_<command>` returns detailed process information.
+Deleting a process file, for example `DELE /proc/105_0000_ps`, sends `SIGKILL`
+to that process.
+
 Note: the copy and move commands return immediately with `250 Copy started in
 background` or `250 Move started in background`; errors during the background
 operation are not reported to the client. Only one copy, move, recursive

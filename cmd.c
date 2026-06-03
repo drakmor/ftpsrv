@@ -41,6 +41,9 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "cmd.h"
+#if defined(__PROSPERO__)
+#include "cmd-proc.h"
+#endif
 #include "io.h"
 #include "kstuff_autopause.h"
 #include "log.h"
@@ -60,6 +63,8 @@ along with this program; see the file COPYING. If not, see
 #define DISABLE_ASCII_MODE
 
 // #define IO_USE_SENDFILE  // Disabled. Speed x2 down ?!
+
+typedef struct ftp_xfer_buf ftp_xfer_buf_t;
 
 #if defined(IO_USE_AIO)
 static int
@@ -909,7 +914,6 @@ ftp_format_list_time(time_t t, char *buf, size_t bufsize) {
   return 0;
 }
 
-
 /**
  * Enter passive mode.
  **/
@@ -946,7 +950,6 @@ ftp_cmd_PASV(ftp_env_t *env, const char* arg) {
     (p >> 8) & 0xFF, (p >> 0) & 0xFF);
 }
 
-
 /**
  * Enter extended passive mode.
  **/
@@ -980,7 +983,6 @@ ftp_cmd_EPSV(ftp_env_t *env, const char *arg) {
                            port);
 }
 
-
 /**
  * Change the working directory to its parent.
  **/
@@ -1004,7 +1006,6 @@ ftp_cmd_CDUP(ftp_env_t *env, const char* arg) {
 
   return ftp_active_printf(env, "250 OK\r\n");
 }
-
 
 /**
  * Change the permission mode bits of a path.
@@ -1231,7 +1232,6 @@ ftp_cmd_XQUOTA(ftp_env_t *env, const char* arg) {
   return ftp_active_printf(env, "213 File and disk usage end\r\n");
 }
 
-
 /**
  * Change the working directory.
  **/
@@ -1247,6 +1247,15 @@ ftp_cmd_CWD(ftp_env_t *env, const char* arg) {
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), arg)) {
     return ftp_perror(env);
   }
+#if defined(__PROSPERO__)
+  if(ftp_proc_is_root_path(pathbuf)) {
+    snprintf(env->cwd, sizeof(env->cwd), "%s", pathbuf);
+    return ftp_active_printf(env, "250 OK\r\n");
+  }
+  if(ftp_proc_is_path(pathbuf)) {
+    return ftp_active_printf(env, "550 No such directory\r\n");
+  }
+#endif
   if(stat(pathbuf, &st)) {
     return ftp_perror(env);
   }
@@ -1259,7 +1268,6 @@ ftp_cmd_CWD(ftp_env_t *env, const char* arg) {
 
   return ftp_active_printf(env, "250 OK\r\n");
 }
-
 
 /**
  * Delete a given file.
@@ -1276,6 +1284,11 @@ ftp_cmd_DELE(ftp_env_t *env, const char* arg) {
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), arg)) {
     return ftp_perror(env);
   }
+#if defined(__PROSPERO__)
+  if(ftp_proc_is_path(pathbuf)) {
+    return ftp_proc_cmd_DELE(env, pathbuf);
+  }
+#endif
   if(lstat(pathbuf, &st)) {
     return ftp_perror(env);
   }
@@ -1289,20 +1302,17 @@ ftp_cmd_DELE(ftp_env_t *env, const char* arg) {
   return ftp_active_printf(env, "250 File deleted\r\n");
 }
 
-
-
 /**
  * Buffered data-transfer helpers for directory listings.
- *
  **/
-typedef struct ftp_xfer_buf {
+struct ftp_xfer_buf {
   ftp_env_t *env;
   char *buf;
   size_t cap;
   size_t len;
   int free_buf;
   int failed;
-} ftp_xfer_buf_t;
+};
 
 /**
  * Release any heap buffer used by the listing transfer buffer.
@@ -1371,7 +1381,6 @@ ftp_xfer_vprintf(ftp_xfer_buf_t *x, const char *fmt, va_list ap) {
     va_end(aq);
 
     if(n < 0) {
-      // Formatting error; let caller decide whether to skip entry.
       return -1;
     }
 
@@ -1380,12 +1389,10 @@ ftp_xfer_vprintf(ftp_xfer_buf_t *x, const char *fmt, va_list ap) {
       return 0;
     }
 
-    // Not enough space -> flush and try again. 
     if(ftp_xfer_flush(x)) {
       return -1;
     }
 
-    // If a single line is larger than the buffer, format into a temp string and write directly. 
     if((size_t)n >= x->cap) {
       size_t need = (size_t)n + 1;
       char *tmp = malloc(need);
@@ -1408,8 +1415,6 @@ ftp_xfer_vprintf(ftp_xfer_buf_t *x, const char *fmt, va_list ap) {
       free(tmp);
       return wr;
     }
-
-    // else: retry with empty buffer 
   }
 }
 
@@ -1426,10 +1431,9 @@ ftp_xfer_printf(ftp_xfer_buf_t *x, const char *fmt, ...) {
   return rc;
 }
 
-
 /**
-* Shared prologue/epilogue for LIST/NLST/MLSD 
-**/
+ * Shared prologue/epilogue for LIST/NLST/MLSD.
+ **/
 static int
 ftp_list_xfer_start(ftp_env_t *env, DIR *dir, ftp_xfer_buf_t *x) {
   memset(x, 0, sizeof(*x));
@@ -1494,7 +1498,6 @@ ftp_list_xfer_finish(ftp_env_t *env, DIR *dir, ftp_xfer_buf_t *x) {
   }
   return ftp_active_printf(env, "226 Transfer complete\r\n");
 }
-
 
 /**
  * Join a directory path and entry name into a single path.
@@ -2758,6 +2761,18 @@ ftp_cmd_LIST(ftp_env_t *env, const char *arg) {
   char modebuf[20];
   ftp_xfer_buf_t x;
   int dir_errno = 0;
+
+#if defined(__PROSPERO__)
+  char proc_path[PATH_MAX];
+
+  if(ftp_proc_resolve_arg(env, arg, 1, proc_path, sizeof(proc_path))) {
+    return ftp_perror(env);
+  }
+  if(ftp_proc_is_path(proc_path)) {
+    return ftp_proc_cmd_LIST(env, proc_path);
+  }
+#endif
+
   int err = ftp_list_open(env, arg, 1, 1, 1, &ctx, &dir_errno);
   if(err) {
     return err < 0 ? err : 0;
@@ -2829,6 +2844,9 @@ ftp_cmd_LIST(ftp_env_t *env, const char *arg) {
 #endif
 
   int read_errno = 0;
+#if defined(__PROSPERO__)
+  int include_proc_dir = ftp_proc_is_root_listing(ctx.dir_path);
+#endif
 
   for(;;) {
     int next = ftp_list_next_entry(env, ctx.dir, dir_fd, ctx.dir_path,
@@ -2840,6 +2858,11 @@ ftp_cmd_LIST(ftp_env_t *env, const char *arg) {
     if(next == 0) {
       break;
     }
+#if defined(__PROSPERO__)
+    if(ftp_proc_hide_real_proc_entry(ctx.dir_path, ent->d_name)) {
+      continue;
+    }
+#endif
 
     ftp_mode_string(statbuf.st_mode, modebuf);
     if(ftp_format_list_time(statbuf.st_mtime, timebuf, sizeof(timebuf))) {
@@ -2865,6 +2888,16 @@ ftp_cmd_LIST(ftp_env_t *env, const char *arg) {
     }
   }
 
+#if defined(__PROSPERO__)
+  if(include_proc_dir && !x.failed) {
+    char proc_line[128];
+
+    if(ftp_proc_format_root_list_line(proc_line, sizeof(proc_line)) == 0) {
+      (void)ftp_xfer_printf(&x, "%s", proc_line);
+    }
+  }
+#endif
+
   if(read_errno && !x.failed) {
     errno = read_errno;
     (void)ftp_perror(env);
@@ -2885,6 +2918,18 @@ ftp_cmd_NLST(ftp_env_t *env, const char *arg) {
   ftp_list_ctx_t ctx;
   struct dirent *ent;
   ftp_xfer_buf_t x;
+
+#if defined(__PROSPERO__)
+  char proc_path[PATH_MAX];
+
+  if(ftp_proc_resolve_arg(env, arg, 0, proc_path, sizeof(proc_path))) {
+    return ftp_perror(env);
+  }
+  if(ftp_proc_is_path(proc_path)) {
+    return ftp_proc_cmd_NLST(env, proc_path);
+  }
+#endif
+
   int err = ftp_list_open(env, arg, 0, 0, 0, &ctx, NULL);
   if(err) {
     return err < 0 ? err : 0;
@@ -2897,6 +2942,9 @@ ftp_cmd_NLST(ftp_env_t *env, const char *arg) {
   }
 
   int read_errno = 0;
+#if defined(__PROSPERO__)
+  int include_proc_dir = ftp_proc_is_root_listing(ctx.dir_path);
+#endif
 
   for(;;) {
     int next = ftp_list_next_dirent(ctx.dir, &ent);
@@ -2907,6 +2955,11 @@ ftp_cmd_NLST(ftp_env_t *env, const char *arg) {
     if(next == 0) {
       break;
     }
+#if defined(__PROSPERO__)
+    if(ftp_proc_hide_real_proc_entry(ctx.dir_path, ent->d_name)) {
+      continue;
+    }
+#endif
 
     if(ftp_xfer_printf(&x, "%s\r\n", ent->d_name)) {
       if(x.failed) {
@@ -2920,6 +2973,12 @@ ftp_cmd_NLST(ftp_env_t *env, const char *arg) {
       break;
     }
   }
+
+#if defined(__PROSPERO__)
+  if(include_proc_dir && !x.failed) {
+    (void)ftp_xfer_printf(&x, "proc\r\n");
+  }
+#endif
 
   if(read_errno && !x.failed) {
     errno = read_errno;
@@ -2942,6 +3001,18 @@ ftp_cmd_MLSD(ftp_env_t *env, const char *arg) {
   struct dirent *ent;
   struct stat statbuf;
   ftp_xfer_buf_t x;
+
+#if defined(__PROSPERO__)
+  char proc_path[PATH_MAX];
+
+  if(ftp_proc_resolve_arg(env, arg, 0, proc_path, sizeof(proc_path))) {
+    return ftp_perror(env);
+  }
+  if(ftp_proc_is_path(proc_path)) {
+    return ftp_proc_cmd_MLSD(env, proc_path);
+  }
+#endif
+
   int err = ftp_list_open(env, arg, 1, 0, 0, &ctx, NULL);
   if(err) {
     return err < 0 ? err : 0;
@@ -2959,6 +3030,9 @@ ftp_cmd_MLSD(ftp_env_t *env, const char *arg) {
 #endif
 
   int read_errno = 0;
+#if defined(__PROSPERO__)
+  int include_proc_dir = ftp_proc_is_root_listing(ctx.dir_path);
+#endif
 
   for(;;) {
     const char *type;
@@ -2980,6 +3054,11 @@ ftp_cmd_MLSD(ftp_env_t *env, const char *arg) {
     if(next == 0) {
       break;
     }
+#if defined(__PROSPERO__)
+    if(ftp_proc_hide_real_proc_entry(ctx.dir_path, ent->d_name)) {
+      continue;
+    }
+#endif
 
     const char *link_path = NULL;
     if(S_ISLNK(statbuf.st_mode)) {
@@ -3014,6 +3093,16 @@ ftp_cmd_MLSD(ftp_env_t *env, const char *arg) {
       break;
     }
   }
+
+#if defined(__PROSPERO__)
+  if(include_proc_dir && !x.failed) {
+    char *linebuf = ctx.pathbuf;
+
+    if(ftp_proc_format_root_mlsd_line(linebuf, PATH_MAX * 3) == 0) {
+      (void)ftp_xfer_printf(&x, "%s", linebuf);
+    }
+  }
+#endif
 
   if(read_errno && !x.failed) {
     errno = read_errno;
@@ -3652,6 +3741,11 @@ ftp_cmd_RETR(ftp_env_t *env, const char* arg) {
   if(ftp_abspath(env, path, sizeof(path), arg)) {
     return ftp_perror(env);
   }
+#if defined(__PROSPERO__)
+  if(ftp_proc_is_path(path)) {
+    return ftp_proc_cmd_RETR(env, path);
+  }
+#endif
   if((fd=open(path, O_RDONLY, 0)) < 0) {
     return ftp_perror(env);
   }
@@ -6228,6 +6322,11 @@ ftp_cmd_SIZE(ftp_env_t *env, const char* arg) {
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), arg)) {
     return ftp_perror(env);
   }
+#if defined(__PROSPERO__)
+  if(ftp_proc_is_path(pathbuf)) {
+    return ftp_proc_cmd_SIZE(env, pathbuf);
+  }
+#endif
 
   if(env->self2elf) {
     size_t elf_size = self_get_elfsize(pathbuf);
@@ -6639,6 +6738,11 @@ ftp_cmd_MDTM(ftp_env_t *env, const char *arg) {
   if(ftp_abspath(env, pathbuf, sizeof(pathbuf), arg)) {
     return ftp_perror(env);
   }
+#if defined(__PROSPERO__)
+  if(ftp_proc_is_path(pathbuf)) {
+    return ftp_proc_cmd_MDTM(env, pathbuf);
+  }
+#endif
   if(stat(pathbuf, &st)) {
     return ftp_perror(env);
   }
@@ -6680,6 +6784,12 @@ ftp_cmd_MLST(ftp_env_t *env, const char *arg) {
     }
     name = pathbuf;
   }
+
+#if defined(__PROSPERO__)
+  if(ftp_proc_is_path(pathbuf)) {
+    return ftp_proc_cmd_MLST(env, pathbuf);
+  }
+#endif
 
   if(lstat(pathbuf, &st)) {
     return ftp_perror(env);
